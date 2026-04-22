@@ -164,3 +164,24 @@ Scope changes to the plan are recorded here with a revision note; the plan docum
 - Run migration once dated `_unknown-date` directories have correctly-formed successors; see commit 1's Next.
 - Bug #2 diagnosis from the now-smaller active set.
 - Remaining scope unchanged: CLOB WS, end-to-end verification, reconnect tests, Phase 2 ACs.
+
+---
+
+**Post-deploy note (commit 2).** Indicator 1 showed `active=0` across the first two poll cycles post-deploy, `raw=94–95`. Matches the pre-deploy state on the same timeframe — no tennis live at 19:56–20:00 UTC, so the live-only filter had nothing to confirm or deny on resolved matches. Indicators 2/3/4 unread pending a live match. Bug #2 diagnosis and commit-1 migration dry-run proceed in parallel with the wait.
+
+**Bug #4 (previously "startup race, cosmetic").** Promoted to a named bug as the live-only filter compounds it. Sports WS worker, on empty slug set, opens a Markets WS connection, receives no slugs to subscribe to, idles 30s, reconnects. Loop observed post-deploy. Wasteful but not data-losing. Tighten when convenient — conditions for fix: don't open the Markets WS connection if slug set is empty; re-check slug set at 30s intervals without reconnecting; only connect when non-empty.
+
+**Tools shipped for session 2.2, commit 3.**
+
+Commit 3 bundles two scripts and corresponding log entries. Triggered by the commit-1 migration dry-run surfacing a fundamental layout assumption error: v1 of the migration (and the original diagnostic draft) assumed meta.json sat alongside events in a single tree. The real archive has two parallel trees — `matches/{match_id}/meta.json` for metadata and `polymarket_sports/{match_id}/events-*.jsonl` for WS events. Both trees carry match_id-named directories; the session 2.1 bug #1 polluted both with `_unknown-date` suffixes.
+
+- `code/capture/migrate_unknown_dates.py` **(v2 rewrite)**: two-phase migration. Phase 1 walks `matches/` using meta.json's `start_date_iso` as the authoritative date source. Phase 2 walks `polymarket_sports/`, resolving correct names either from phase 1's rename map (same-run) or via prefix scan of `matches/` for an already-renamed sibling (re-run). Skips cleanly on: target exists, missing meta, invalid date, no renamed sibling, multiple ambiguous siblings. Idempotent — re-runs are safe.
+- `code/capture/diagnose_bug2.py`: offline diagnostic. Reads `polymarket_sports/` for routed-event counts per match and events in `_unresolved/`. Reads `matches/{*}/meta.json` (skipping `_unknown-date` dirs as superseded post-migration) for slug ownership. Reports: per-match event counts, unresolved-by-slug tally with owner attribution, orphan slugs (no meta.json owner), first-routed vs first-unresolved timing per match, tree-consistency check, cross-match contamination check. Read-only, re-runnable.
+
+Commit-1 migration dry-run evidence (for the record):
+- 8 `matches/*_unknown-date` directories, 6 of which have correctly-named siblings (commit 2 wrote fresh meta.json after matches went live post-deploy, resolving indicator 2 empirically — player names populated, match_ids correctly-formed). The remaining 2 (`challenger-rome`, `oeiras-4`) have no clean sibling yet.
+- 8 `polymarket_sports/*_unknown-date` directories with no meta.json of their own (they never had one — meta.json lives in the other tree).
+- v1 of the migration tried to walk both trees with the same logic, would have renamed 2 matches/ dirs without touching the 8 sports/ dirs, producing an internally inconsistent archive.
+- v2 correctly plans: phase 1 renames 2 in matches/, skips 2 target-exists; phase 2 renames all 8 in polymarket_sports/ (6 via sibling lookup, 2 via rename_map). Tested end-to-end on synthetic archive mirroring the observed state; idempotent on re-run.
+
+**Outstanding: two `matches/` _unknown-date dirs survive phase 1** for matches where commit 2 wrote a fresh correctly-named dir. Phase 1 skips them (target exists). Three handling options open for operator decision: leave as-is (provenance), delete (risk: any fields unique to old meta.json), or rename with a suffix like `.migrated` (preserves without polluting active namespace). Default in commit 3 is leave-as-is — diagnostic skips them for ownership purposes.

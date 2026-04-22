@@ -1,51 +1,53 @@
-"""One-shot migration: rename `*_unknown-date` match directories.
+"""One-shot migration: rename `*_unknown-date` match directories (v2).
 
 Context
 -------
-Session 2.1 shipped with a bug in resolver._extract_event_date (originally
-inline in resolve_polymarket_event): the canonical match_id was built by
-reading `event.get("eventDate")`, but Gamma doesn't populate that field.
-The field we want is `startDate`. Every match discovered in session 2.1
-landed with an `_unknown-date` suffix in its canonical match_id, and the
-corresponding directories on disk carry that suffix too.
+Session 2.1's resolver wrote `_unknown-date` as the date suffix on every
+match_id because `event.get("eventDate")` returns empty on the Polymarket
+US gateway. Directories on disk carry that suffix. Commit 1 (session 2.2)
+fixed the resolver to read `startDate`. This script repairs the already-
+written directories.
 
-The code fix (resolver.py / discovery.py) lands first and prevents new
-matches from being created with `_unknown-date`. This script then repairs
-the existing ones.
+v2 rewrite: v1 assumed meta.json sat alongside events. The actual archive
+layout has two parallel trees:
+
+    /data/archive/matches/{match_id}/meta.json                (metadata)
+    /data/archive/polymarket_sports/{match_id}/events-*.jsonl (WS events)
+    /data/archive/polymarket_sports/_unresolved/...           (bug #2 orphans)
+
+Both trees hold match_id-named directories and both were polluted by the
+session 2.1 bug. v2 migrates both, using `matches/{name}/meta.json` as the
+single source of truth for the correct date. The companion
+`polymarket_sports/{name}/` dir (which has no meta.json of its own) is
+renamed by reference to its sibling in `matches/`.
 
 What it does
 ------------
-For every directory whose name ends in `_unknown-date` anywhere under
-`--archive-root`:
-  1. Read its meta.json.
-  2. Compute the correct event_date from meta.json's `start_date_iso`
-     (already written by discovery.py on every poll, so it's present and
-     correct even on the broken match_ids).
-  3. Build the corrected match_id by replacing the `_unknown-date` suffix.
-  4. Rename the directory and rewrite meta.json's `match_id` and
-     `event_date` fields to match.
+Phase 1 — matches/ tree:
+  For every `matches/*_unknown-date/` with a readable meta.json and a
+  parseable `start_date_iso`, build the corrected match_id and rename the
+  directory. Rewrite meta.json's `match_id` and `event_date` fields and
+  append a migration provenance entry.
+
+Phase 2 — polymarket_sports/ tree:
+  For every `polymarket_sports/*_unknown-date/`, look up the correct name
+  either in this run's phase-1 rename map, or by scanning matches/ for a
+  sibling whose prefix matches and whose suffix is a valid date (supports
+  re-runs where phase 1 already renamed in a prior invocation). Rename the
+  events directory to match. No metadata to rewrite.
 
 Idempotency
 -----------
-Safe to re-run. If the target directory already exists (partial prior run),
-the script logs and skips. If `start_date_iso` is missing, empty, or not a
-parseable YYYY-MM-DD prefix, the script logs and skips — it never guesses.
-
-Usage
------
-Dry run (prints plan, touches nothing):
-    python -m code.capture.migrate_unknown_dates --archive-root /data/archive --dry-run
-
-Apply:
-    python -m code.capture.migrate_unknown_dates --archive-root /data/archive
-
-The archive root is required (no default) because running this against
-the wrong directory would be destructive.
+Safe to re-run. Skips (cleanly, no errors):
+  - Target dir already exists (e.g., commit 2 wrote a fresh correctly-named
+    dir after a match went live; or prior run already renamed).
+  - Phase 1: source has no meta.json, or start_date_iso missing/invalid.
+  - Phase 2: no renamed sibling in matches/, or multiple ambiguous siblings.
 
 Out of scope
 ------------
-This script does NOT touch events in `_unresolved/` — those are bug #2's
-territory and gated on understanding that root cause separately.
+Does not touch `polymarket_sports/_unresolved/` — bug #2 territory.
+Does not touch `gamma/` snapshots — those are per-date, not per-match.
 """
 
 from __future__ import annotations
@@ -59,30 +61,26 @@ from pathlib import Path
 log = logging.getLogger("migrate_unknown_dates")
 
 UNKNOWN_DATE_SUFFIX = "_unknown-date"
+MATCHES_SUBDIR = "matches"
+SPORTS_SUBDIR = "polymarket_sports"
 
 
 def find_unknown_date_dirs(root: Path) -> list[Path]:
-    """Walk the archive root, return every directory ending in the suffix."""
+    """Shallow scan: direct children of `root` ending in the suffix."""
     if not root.exists():
-        log.error("Archive root does not exist: %s", root)
         return []
     results: list[Path] = []
-    for p in root.rglob("*"):
+    for p in sorted(root.iterdir()):
         if p.is_dir() and p.name.endswith(UNKNOWN_DATE_SUFFIX):
             results.append(p)
-    return sorted(results)
+    return results
 
 
 def parse_event_date(start_date_iso: str) -> str | None:
-    """Return YYYY-MM-DD slice if start_date_iso looks valid, else None.
-
-    Validates that the first 10 characters match the YYYY-MM-DD shape
-    (`NNNN-NN-NN`) rather than trusting the slice blindly.
-    """
+    """Return YYYY-MM-DD slice if start_date_iso looks valid, else None."""
     if not isinstance(start_date_iso, str) or len(start_date_iso) < 10:
         return None
     candidate = start_date_iso[:10]
-    # Minimal YYYY-MM-DD shape check without pulling in a datetime parser.
     if (
         len(candidate) == 10
         and candidate[4] == "-"
@@ -96,7 +94,6 @@ def parse_event_date(start_date_iso: str) -> str | None:
 
 
 def rebuild_match_id(old_match_id: str, new_date: str) -> str:
-    """Replace the trailing `_unknown-date` with `_{new_date}`."""
     if not old_match_id.endswith(UNKNOWN_DATE_SUFFIX):
         raise ValueError(
             f"match_id does not end in {UNKNOWN_DATE_SUFFIX!r}: {old_match_id!r}"
@@ -105,23 +102,24 @@ def rebuild_match_id(old_match_id: str, new_date: str) -> str:
     return f"{prefix}_{new_date}"
 
 
-def migrate_one(dir_path: Path, dry_run: bool) -> str:
-    """Migrate a single `_unknown-date` directory.
+# --- Phase 1: matches/ tree -------------------------------------------------
 
-    Returns a status token for reporting: one of
-      "renamed", "skipped_no_meta", "skipped_bad_meta", "skipped_no_date",
-      "skipped_target_exists", "skipped_already_correct".
+
+def migrate_matches_dir(dir_path: Path, dry_run: bool) -> tuple[str, str | None]:
+    """Migrate one matches/*_unknown-date/ dir.
+
+    Returns (status_token, new_name_or_None).
     """
     meta_path = dir_path / "meta.json"
     if not meta_path.exists():
         log.warning("  [skip] no meta.json in %s", dir_path)
-        return "skipped_no_meta"
+        return "skipped_no_meta", None
 
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         log.error("  [skip] meta.json not parseable in %s: %s", dir_path, exc)
-        return "skipped_bad_meta"
+        return "skipped_bad_meta", None
 
     start_date_iso = meta.get("start_date_iso") or ""
     new_date = parse_event_date(start_date_iso)
@@ -131,69 +129,128 @@ def migrate_one(dir_path: Path, dry_run: bool) -> str:
             dir_path,
             start_date_iso,
         )
-        return "skipped_no_date"
+        return "skipped_no_date", None
 
-    old_match_id = dir_path.name
+    old_name = dir_path.name
     try:
-        new_match_id = rebuild_match_id(old_match_id, new_date)
+        new_name = rebuild_match_id(old_name, new_date)
     except ValueError:
-        # Guard against walk-tree surprises — we filter by suffix already,
-        # but belt-and-braces.
-        log.error("  [skip] unexpected match_id shape: %r", old_match_id)
-        return "skipped_bad_meta"
+        log.error("  [skip] unexpected match_id shape: %r", old_name)
+        return "skipped_bad_meta", None
 
-    target = dir_path.with_name(new_match_id)
-    if target == dir_path:
-        # Shouldn't happen given the suffix filter, but handle cleanly.
-        return "skipped_already_correct"
-
+    target = dir_path.with_name(new_name)
     if target.exists():
-        log.warning(
-            "  [skip] target already exists: %s (prior partial migration?)",
-            target,
-        )
-        return "skipped_target_exists"
+        log.info("  [skip] target exists: %s", target)
+        return "skipped_target_exists", None
 
-    log.info("  %s", old_match_id)
-    log.info("    -> %s", new_match_id)
+    log.info("  %s", old_name)
+    log.info("    -> %s", new_name)
 
     if dry_run:
-        return "renamed"  # counted as would-rename in dry-run tally
+        return "renamed", new_name
 
-    # Apply: rename dir first, then rewrite meta.json in the new location.
-    # Order matters: if the rename succeeds and the meta write fails, a
-    # re-run will still find the new dir with the stale match_id inside
-    # and correct it (re-run reads new dir's meta and notices match_id
-    # still has _unknown-date — but wait, on the second run the dir no
-    # longer ends in _unknown-date, so find_unknown_date_dirs won't pick
-    # it up). We therefore write meta.json first, then rename — reversing
-    # that order. If the rename fails after meta is written, next run
-    # will still find the old-named dir (ends in _unknown-date) and
-    # reprocess from scratch.
-    meta["match_id"] = new_match_id
+    meta["match_id"] = new_name
     meta["event_date"] = new_date
-    # Append a migration provenance note. Small, optional.
     migrations = meta.get("migrations") or []
     migrations.append(
         {
             "kind": "unknown_date_rename",
-            "from_match_id": old_match_id,
-            "to_match_id": new_match_id,
+            "phase": "matches",
+            "from_match_id": old_name,
+            "to_match_id": new_name,
             "source_field": "start_date_iso",
         }
     )
     meta["migrations"] = migrations
-
     meta_path.write_text(
         json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
     )
     dir_path.rename(target)
+    return "renamed", new_name
+
+
+# --- Phase 2: polymarket_sports/ tree ---------------------------------------
+
+
+def _date_suffix_is_valid(name: str, prefix: str) -> bool:
+    """True if name == prefix + "_" + YYYY-MM-DD."""
+    expected_prefix = f"{prefix}_"
+    if not name.startswith(expected_prefix):
+        return False
+    if name.endswith(UNKNOWN_DATE_SUFFIX):
+        return False
+    suffix = name[len(expected_prefix):]
+    return parse_event_date(suffix) is not None
+
+
+def migrate_sports_dir(
+    dir_path: Path,
+    matches_root: Path,
+    rename_map: dict[str, str],
+    dry_run: bool,
+) -> str:
+    """Migrate one polymarket_sports/*_unknown-date/ dir."""
+    old_name = dir_path.name
+
+    # Source of truth 1: phase 1 renamed the sibling in this run.
+    new_name = rename_map.get(old_name)
+
+    # Source of truth 2: phase 1 in a prior run already renamed the
+    # matches/ sibling; find it by prefix scan.
+    if new_name is None and matches_root.exists():
+        prefix = old_name[: -len(UNKNOWN_DATE_SUFFIX)]
+        candidates = [
+            p for p in matches_root.iterdir()
+            if p.is_dir() and _date_suffix_is_valid(p.name, prefix)
+        ]
+        if len(candidates) == 1:
+            new_name = candidates[0].name
+            log.info(
+                "  [phase2] resolved %s via existing sibling %s",
+                old_name,
+                candidates[0].name,
+            )
+        elif len(candidates) > 1:
+            log.warning(
+                "  [skip] %s has multiple matches/ siblings: %s — "
+                "can't disambiguate",
+                old_name,
+                sorted(c.name for c in candidates),
+            )
+            return "skipped_ambiguous"
+
+    if new_name is None:
+        log.warning(
+            "  [skip] %s has no meta.json sibling in matches/ — "
+            "cannot determine date",
+            dir_path,
+        )
+        return "skipped_no_sibling"
+
+    target = dir_path.with_name(new_name)
+    if target.exists():
+        log.info("  [skip] target exists: %s", target)
+        return "skipped_target_exists"
+
+    log.info("  %s", old_name)
+    log.info("    -> %s", new_name)
+
+    if dry_run:
+        return "renamed"
+
+    dir_path.rename(target)
     return "renamed"
+
+
+# --- Entry point ------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Rename _unknown-date match directories using start_date_iso from meta.json.",
+        description=(
+            "Rename _unknown-date directories in the two-tree archive layout "
+            "(matches/ for metadata, polymarket_sports/ for events)."
+        ),
     )
     parser.add_argument(
         "--archive-root",
@@ -220,27 +277,53 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     root: Path = args.archive_root.resolve()
-    log.info("Archive root: %s", root)
+    matches_root = root / MATCHES_SUBDIR
+    sports_root = root / SPORTS_SUBDIR
+
+    log.info("Archive root:       %s", root)
+    log.info("matches/ subdir:    %s", matches_root)
+    log.info("polymarket_sports/: %s", sports_root)
     log.info("Mode: %s", "DRY RUN" if args.dry_run else "APPLY")
 
-    dirs = find_unknown_date_dirs(root)
-    log.info("Found %d candidate directories ending in %r",
-             len(dirs), UNKNOWN_DATE_SUFFIX)
+    # --- Phase 1: matches/ ---
+    log.info("")
+    log.info("=== Phase 1: matches/ (metadata tree, authoritative for dates) ===")
+    matches_candidates = find_unknown_date_dirs(matches_root)
+    log.info("Phase 1 candidates: %d", len(matches_candidates))
 
-    if not dirs:
-        log.info("Nothing to do.")
-        return 0
+    matches_counters: dict[str, int] = {}
+    rename_map: dict[str, str] = {}
+    for d in matches_candidates:
+        status, new_name = migrate_matches_dir(d, dry_run=args.dry_run)
+        matches_counters[status] = matches_counters.get(status, 0) + 1
+        if status == "renamed" and new_name:
+            rename_map[d.name] = new_name
 
-    counters: dict[str, int] = {}
-    for d in dirs:
-        status = migrate_one(d, dry_run=args.dry_run)
-        counters[status] = counters.get(status, 0) + 1
+    # --- Phase 2: polymarket_sports/ ---
+    log.info("")
+    log.info("=== Phase 2: polymarket_sports/ (events tree) ===")
+    sports_candidates = find_unknown_date_dirs(sports_root)
+    log.info("Phase 2 candidates: %d", len(sports_candidates))
 
-    log.info("-- Summary --")
-    for status, count in sorted(counters.items()):
+    sports_counters: dict[str, int] = {}
+    for d in sports_candidates:
+        status = migrate_sports_dir(
+            d, matches_root, rename_map, dry_run=args.dry_run
+        )
+        sports_counters[status] = sports_counters.get(status, 0) + 1
+
+    # --- Summary ---
+    log.info("")
+    log.info("=== Summary ===")
+    log.info("Phase 1 (matches/):")
+    for status, count in sorted(matches_counters.items()):
+        log.info("  %s: %d", status, count)
+    log.info("Phase 2 (polymarket_sports/):")
+    for status, count in sorted(sports_counters.items()):
         log.info("  %s: %d", status, count)
 
     if args.dry_run:
+        log.info("")
         log.info("Dry run complete. Re-run without --dry-run to apply.")
     else:
         log.info("Migration complete.")
