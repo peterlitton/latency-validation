@@ -35,7 +35,12 @@ from .config import (
     TENNIS_SPORT_SLUG,
     USER_AGENT,
 )
-from .resolver import ResolvedIdentity, load_overrides, resolve_polymarket_event
+from .resolver import (
+    ResolvedIdentity,
+    _extract_event_date,
+    load_overrides,
+    resolve_polymarket_event,
+)
 
 log = logging.getLogger("capture.discovery")
 
@@ -348,7 +353,10 @@ def _build_meta(
         "title": event.get("title") or "",
         "tournament_name": tennis_state.get("tournamentName") or "",
         "round": tennis_state.get("round") or "",
-        "event_date": (event.get("eventDate") or "")[:10],
+        # event_date is the YYYY-MM-DD component used in match_id. Sourced
+        # from startDate (empirically present) with fallback to eventDate;
+        # see resolver._extract_event_date for rationale.
+        "event_date": _extract_event_date(event),
         "start_date_iso": event.get("startDate") or "",
         "end_date_iso": event.get("endDate") or "",
         # Players.

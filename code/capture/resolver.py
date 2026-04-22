@@ -160,13 +160,31 @@ def load_overrides(path: Path | None = None) -> dict[str, Any]:
 # --- Polymarket-specific resolver ------------------------------------------
 
 
+def _extract_event_date(event: dict[str, Any]) -> str:
+    """Pull the event date as YYYY-MM-DD from a Gamma event payload.
+
+    Prefers `startDate` (empirically present on Gamma events, per session 2.1
+    discovery; same field PM-Tennis uses at H-016). Falls back to `eventDate`
+    (named in the brief but empirically absent from Gamma responses). Returns
+    empty string if neither is present or usable, which produces the
+    "unknown-date" canonical suffix downstream.
+
+    The `[:10]` slice handles both ISO-8601 with time (`"2026-04-22T13:00:00Z"`)
+    and plain-date (`"2026-04-22"`) inputs.
+    """
+    raw = event.get("startDate") or event.get("eventDate") or ""
+    if not isinstance(raw, str):
+        return ""
+    return raw[:10]
+
+
 def resolve_polymarket_event(
     event: dict[str, Any],
     overrides: dict[str, Any] | None = None,
 ) -> ResolvedIdentity:
     """Given a raw Gamma event object, produce a ResolvedIdentity.
 
-    Uses the event's metadata fields (tournamentName, participants, eventDate).
+    Uses the event's metadata fields (tournamentName, participants, startDate).
     Doubles and already-ended events are rejected. Anything else either
     resolves cleanly or gets flagged for override.
     """
@@ -182,7 +200,7 @@ def resolve_polymarket_event(
     ]
     player_names = [n for n in player_names if n]
 
-    event_date = (event.get("eventDate") or "")[:10]  # trim any time portion
+    event_date = _extract_event_date(event)
 
     # Rejections.
     if event.get("ended") or event.get("closed"):
