@@ -1,6 +1,6 @@
 # Latency & Validation Study — v1 Plan
 
-**Document version:** v1.1
+**Document version:** v1.2
 **Document status:** Source of truth for v1. Revised in place if scope changes; revision note in working log.
 **Audience:** Project manager and senior developer. Assumes fluency with REST/WebSocket APIs, JSONL, Plotly, and PaaS deployment.
 **Scope commitment:** v1 only. Follow-on versions (v1.1–v1.8) are named and sized, not planned.
@@ -8,6 +8,7 @@
 **Revision history.**
 - v1.0 — Initial plan.
 - v1.1 — Reconciled session budget (§6 intro, new §6.0 calendar map). Added clock-skew AC to Phase 4. Added operator-availability spec to Phase 6. Tightened Phase 2 reconnect AC. Clarified conceptual-reuse rule (§5.4). Pulled "Polymarket capture runs in background" into §5.2 and Phase 3. Flagged Q3 noise-floor as Phase 7 decision. Added archive-preservation and iPhone-recording-location to done criteria and §10.
+- v1.2 — Corrected §5.4 Polymarket subscription identifier (market_slug, not asset_id; based on PM-Tennis H-020 research against Polymarket US Markets WS docs). Added match-discovery prereq to Phase 2 (§6 Phase 2) — Gamma gateway poll loop is a dependency of both Polymarket WS workers. Filename collision note: document-revision number in filename stays as v1.1; internal document_version bumps to v1.2. File will be renamed at the next collision-forcing event (iPhone study v1.1 plan landing).
 
 ---
 
@@ -75,13 +76,14 @@ Separate service, separate repo from PM-Tennis. Same conceptual shape as PM-Tenn
 
 ### 5.2 Capture workers
 
-Three concurrent async workers:
+Three concurrent async event-capture workers, plus a discovery loop:
 
 1. **API-Tennis WS worker.** Subscribes to point and game events. Writes to `archive/api_tennis/{match_id}/{date}.jsonl`.
 2. **Polymarket Sports WS worker.** Subscribes to game events for eligible matches. Writes to `archive/polymarket_sports/{match_id}/{date}.jsonl`.
 3. **Polymarket CLOB WS worker.** Subscribes to order book deltas and trades for the markets associated with eligible matches. Writes to `archive/polymarket_clob/{match_id}/{date}.jsonl`.
+4. **Gamma discovery loop.** Not a WS; polls the public Gamma gateway every 60s. Supplies the Sports and CLOB workers with current eligible matches and their subscription identifiers. Writes raw snapshots to `archive/gamma/{date}.jsonl` and per-match meta to `archive/matches/{match_id}/meta.json`. Built in Phase 2 (§6 Phase 2, §5.4).
 
-Each worker's raw payload is written as-is, with an `arrived_at_ms` timestamp from the capture host and a resolved `match_id`. Raw preservation is non-negotiable — downstream analysis must be able to re-derive any field without replaying capture.
+Each event worker's raw payload is written as-is, with an `arrived_at_ms` timestamp from the capture host and a resolved `match_id`. Raw preservation is non-negotiable — downstream analysis must be able to re-derive any field without replaying capture.
 
 **Polymarket workers run continuously from Phase 2 onward**, including through Phase 3 trial activation and Phase 4 calibration. This banks Polymarket data before the trial clock starts and gives Phase 4 calibration a pre-existing corpus to reconcile against once API-Tennis comes online.
 
@@ -97,9 +99,11 @@ Normalization runs offline against the archive. It does not block capture. Speci
 
 ### 5.4 Match identity resolution
 
-Each source uses a different match identifier (API-Tennis `event_key`, Polymarket `asset_id`, any third identifier the CLOB exposes). A per-match mapping table joins them to a study-internal canonical `match_id`.
+Each source uses a different match identifier. API-Tennis uses `event_key`. Polymarket's Markets (Sports) WS subscription unit is `market_slug`, with a documented cap of 100 slugs per subscription; `marketSides[].identifier` values are the asset/token IDs referenced by the CLOB surface. A per-match mapping table joins these to a study-internal canonical `match_id`.
 
-Built at match discovery by fuzzy name match (normalized player names, tournament, round) plus a manual overrides file. The overrides file starts empty and is appended to as edge cases surface. Format is a decision for Phase 2; a flat YAML or JSONL file keyed by canonical `match_id` with per-source ID fields is the default.
+Match discovery on Polymarket's side uses the public Gamma gateway (`https://gateway.polymarket.us`), unauthenticated — specifically `GET /v2/sports/tennis/events`. The poll returns event objects containing `id`, `slug`, `title`, `sportradarGameId`, the market list, and status flags (`active`, `live`, `ended`, `closed`). The Sportradar game ID is the correlation key for the Sports WS payload stream. The discovery loop is a prerequisite for the Sports WS and CLOB WS workers — without it, there are no subscription identifiers to subscribe to. Phase 2 builds the discovery loop alongside the two WS workers (§6 Phase 2).
+
+Mapping is built at match discovery by fuzzy name match (normalized player names, tournament, round) plus a manual overrides file. The overrides file starts empty and is appended to as edge cases surface. Format is a decision for Phase 2; a flat YAML or JSONL file keyed by canonical `match_id` with per-source ID fields is the default.
 
 **Conceptual reuse rule.** Approach is reused from PM-Tennis: reading PM-Tennis source for reference is allowed; importing, vendoring, or copy-pasting code is not. Reimplementation from reading notes or memory is the bar. This applies to all PM-Tennis code throughout v1, not just the resolver.
 
@@ -122,7 +126,7 @@ Each phase lists acceptance criteria. A phase is complete when its ACs are met a
 | Phase | Trigger | Work | Sessions | Calendar |
 |---|---|---|---|---|
 | 1 | Project start | Foundation | 1 | Week 1 |
-| 2 | Phase 1 ACs met | Polymarket capture | 1–2 | Week 1–2 |
+| 2 | Phase 1 ACs met | Discovery loop + Polymarket capture | 2 (possibly 3) | Week 1–2 |
 | 3 | Phase 2 ACs + dense tennis week within 48h | API-Tennis activation (starts 14-day clock) | 1 | Week 2 or 3 |
 | 4 | Phase 3 ACs met | Calibration | 1 | Within trial week 1 |
 | 5 | Phase 4 ACs met | Minimal dashboard | 1 | Within trial week 1 |
@@ -153,22 +157,24 @@ Phases 1–2 are flexible in calendar; the 14-day trial clock does not start unt
 
 ### Phase 2 — Polymarket capture
 
-**Goal:** Two Polymarket workers running against live data, writing raw JSONL, match identity skeleton in place. Runs continuously in background from this phase through Phase 6.
+**Goal:** Discovery loop and two Polymarket workers running against live data, writing raw JSONL, match identity skeleton in place. Runs continuously in background from this phase through Phase 6.
 
 **Work.**
-- Polymarket Sports WS worker. Subscribe, handle reconnect, write raw JSONL with `arrived_at_ms` and `match_id`.
-- Polymarket CLOB WS worker. Same pattern. Subscribes to markets derived from currently-active Sports WS matches.
-- JSONL archive directory structure and file-rotation policy.
-- Match identity resolver, skeleton only: accepts source-native identifiers, returns canonical `match_id`, reads overrides file. Fuzzy name matching is a stub that flags ambiguous cases for manual override rather than guessing.
-- Deploy to capture host. Run against live matches for at least one session's duration.
+- **Gamma discovery loop.** Async poll of `https://gateway.polymarket.us/v2/sports/tennis/events` every 60s. Writes raw event snapshots to `archive/gamma/{date}.jsonl`. Emits a discovery delta (added/removed event IDs) and a per-match meta record. Filters to singles (flags doubles/mixed for exclusion). This is the prerequisite that supplies subscription identifiers to the two WS workers.
+- **Polymarket Sports (Markets) WS worker.** Subscribe by `market_slug` (100 per subscription cap; use multiple subscriptions if discovery surfaces more). Handle reconnect. Write raw JSONL with `arrived_at_ms` and `match_id`.
+- **Polymarket CLOB WS worker.** Subscribes to markets derived from the discovery loop's current active set. Same raw-write pattern. Subscription unit is under investigation by PM-Tennis (may be slug or asset ID per H-020 research); Phase 2 pins the choice once empirically verified against the live endpoint and records the decision in the working log.
+- **JSONL archive directory structure and file-rotation policy.**
+- **Match identity resolver, skeleton only.** Accepts source-native identifiers, returns canonical `match_id`, reads overrides file. Fuzzy name matching is a stub that flags ambiguous cases for manual override rather than guessing.
+- **Deploy to capture host.** Run against live matches for at least one session's duration.
 
 **Acceptance criteria.**
-- Both workers run without crashing for 1+ hours against live data.
-- Raw JSONL written, each event has `arrived_at_ms` and resolved or flagged `match_id`.
-- At least one live match fully captured end-to-end on both Polymarket surfaces.
-- Reconnect logic exercised at least once: kill connection, verify worker recovers within 60 seconds and resumes writing. Disconnect-window data loss is acceptable if the WS does not support replay; if replay is supported, backfill is required. Recovery behavior documented in working log (which WS supports what).
+- Discovery loop runs for 1+ hour, produces at least one non-empty poll, and writes at least one meta.json for a live or upcoming match.
+- Both WS workers run without crashing for 1+ hours against live data.
+- Raw JSONL written by each worker, each event has `arrived_at_ms` and resolved or flagged `match_id`.
+- At least one live match fully captured end-to-end on both Polymarket surfaces (Sports WS and CLOB WS), correlated via discovery.
+- Reconnect logic exercised at least once on each WS: kill connection, verify worker recovers within 60 seconds and resumes writing. Disconnect-window data loss is acceptable if the WS does not support replay; if replay is supported, backfill is required. Recovery behavior documented in working log (which WS supports what).
 
-**Estimate:** 1–2 sessions. Flag: may spill if reconnect behavior on either WS is non-obvious.
+**Estimate:** 2 sessions. Session 1: discovery loop + Sports WS worker + deploy. Session 2: CLOB WS worker + reconnect testing + live-match validation. Flag: may spill to session 3 if CLOB subscription semantics or reconnect behavior is non-obvious.
 
 ### Phase 3 — API-Tennis activation
 
