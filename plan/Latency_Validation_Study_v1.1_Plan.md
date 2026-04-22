@@ -1,6 +1,6 @@
 # Latency & Validation Study — v1 Plan
 
-**Document version:** v1.2
+**Document version:** v1.3
 **Document status:** Source of truth for v1. Revised in place if scope changes; revision note in working log.
 **Audience:** Project manager and senior developer. Assumes fluency with REST/WebSocket APIs, JSONL, Plotly, and PaaS deployment.
 **Scope commitment:** v1 only. Follow-on versions (v1.1–v1.8) are named and sized, not planned.
@@ -9,6 +9,7 @@
 - v1.0 — Initial plan.
 - v1.1 — Reconciled session budget (§6 intro, new §6.0 calendar map). Added clock-skew AC to Phase 4. Added operator-availability spec to Phase 6. Tightened Phase 2 reconnect AC. Clarified conceptual-reuse rule (§5.4). Pulled "Polymarket capture runs in background" into §5.2 and Phase 3. Flagged Q3 noise-floor as Phase 7 decision. Added archive-preservation and iPhone-recording-location to done criteria and §10.
 - v1.2 — Corrected §5.4 Polymarket subscription identifier (market_slug, not asset_id; based on PM-Tennis H-020 research against Polymarket US Markets WS docs). Added match-discovery prereq to Phase 2 (§6 Phase 2) — Gamma gateway poll loop is a dependency of both Polymarket WS workers. Filename collision note: document-revision number in filename stays as v1.1; internal document_version bumps to v1.2. File will be renamed at the next collision-forcing event (iPhone study v1.1 plan landing).
+- v1.3 — §5.4 corrected brief §4.2's "public read, no auth" claim — Polymarket US Markets WS requires Ed25519 handshake auth. Conceptual-reuse rule refined: independence is at the data/analysis layer, not transport. Both v1 and PM-Tennis use the `polymarket-us==0.1.2` SDK for transport; this does not count as importing PM-Tennis code. Independence preserved at: event timestamping, match-ID resolution, archive schema, and analysis notebooks.
 
 ---
 
@@ -105,7 +106,9 @@ Match discovery on Polymarket's side uses the public Gamma gateway (`https://gat
 
 Mapping is built at match discovery by fuzzy name match (normalized player names, tournament, round) plus a manual overrides file. The overrides file starts empty and is appended to as edge cases surface. Format is a decision for Phase 2; a flat YAML or JSONL file keyed by canonical `match_id` with per-source ID fields is the default.
 
-**Conceptual reuse rule.** Approach is reused from PM-Tennis: reading PM-Tennis source for reference is allowed; importing, vendoring, or copy-pasting code is not. Reimplementation from reading notes or memory is the bar. This applies to all PM-Tennis code throughout v1, not just the resolver.
+**Brief §4.2 correction.** The v1 brief described Polymarket's Sports WS and CLOB WS as "public read, no auth needed." This is wrong for Polymarket US — both WebSocket endpoints require Ed25519-signed API key authentication in the handshake (`X-PM-Access-Key` / `X-PM-Timestamp` / `X-PM-Signature`). The public Gamma gateway is unauthenticated; the WebSockets are not. Inline correction — not a separate revision cycle.
+
+**Conceptual reuse rule, refined.** Independence between this study and PM-Tennis is at the data and analysis layers, not the transport layer. Both projects use the same official `polymarket-us` Python SDK (pinned to `0.1.2` to match PM-Tennis's H-023 empirical validation); both receive identical wire payloads from the same Polymarket servers; transport-layer independence would not have produced meaningful analytical independence. What does produce independence, and what v1 preserves: how we timestamp events (`arrived_at_ms` at SDK-handler entry), how we route them to match IDs (our resolver, reimplemented from reading PM-Tennis's discovery.py), how we archive them (our JSONL schema), and how we analyze them (our normalization layer, our Phase 7 notebooks). Reading PM-Tennis source for reference is allowed and expected; importing or copy-pasting PM-Tennis's own code is not. Using the same upstream SDK that PM-Tennis uses does not count as importing PM-Tennis code.
 
 ### 5.5 Analysis environment
 

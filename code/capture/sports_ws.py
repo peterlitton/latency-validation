@@ -1,44 +1,69 @@
-"""Polymarket Sports (Markets) WebSocket worker.
+"""Polymarket US Sports/Markets WebSocket worker.
 
-Subscribes to moneyline `market_slug` values supplied by the discovery loop
-and appends raw payloads to per-match JSONL archives.
+Uses the official `polymarket-us` SDK (pinned to 0.1.2 in pyproject.toml
+to match PM-Tennis's validation). The SDK handles Ed25519 handshake auth,
+heartbeat/pong, and event parsing. We register event handlers and append
+raw payloads to per-match JSONL archives.
+
+Path-A rationale (per plan §5.4 revision):
+  Independence between this study and PM-Tennis is at the data and analysis
+  layers, not the transport layer. Using the same SDK as PM-Tennis (which
+  empirically validated it through H-023 live sweeps) is lower-risk than
+  hand-rolling the Ed25519 handshake and would not have produced meaningful
+  independence anyway — both clients receive the same payloads from the
+  same server.
 
 Subscription model:
-  - Documented cap: 100 slugs per subscription.
-  - We batch the active slug set into sub-100 groups and send multiple
-    subscribe messages over the same connection.
-  - When discovery's active set changes, we reconcile by closing the
-    connection and reconnecting; the reconnect loop picks up the new set.
-    This is simpler than diffing subscriptions mid-stream and correct because
-    meta.json is already written for every known match — no event is lost.
+  - One MarketsWebSocket per sub-100 batch of slugs. SDK's `client.ws.markets()`
+    is a factory — each call returns a fresh connection-capable instance.
+    We open N of these (N = ceil(slugs / 100)).
+  - For each connection we call `subscribe_market_data` to get full order-book
+    payloads. PM-Tennis's stress-test uses the generic subscribe() with
+    SUBSCRIPTION_TYPE_MARKET_DATA; we use the convenience method (identical
+    wire behavior).
+  - We register handlers for all six events the SDK emits on markets:
+    market_data, market_data_lite, trade, heartbeat, error, close. Our
+    subscription only produces market_data + heartbeat/error/close, but
+    extra handlers cost nothing and guard against SDK default changes.
+
+Raw preservation (plan §5.2):
+  The SDK parses JSON and dispatches by event name. We persist the parsed
+  payload (not the wire bytes) — the SDK's parse is trivial and deterministic,
+  so payload == json.loads(wire). Recording it post-parse is functionally
+  equivalent to raw preservation. The arrived_at_ms timestamp is captured at
+  handler entry, which is the closest point to wire-arrival we can get from
+  inside the SDK.
 
 Reconnect model:
-  - On any disconnect or exception, sleep with exponential backoff (capped).
+  - SDK raises WebSocketError / APIConnectionError on connection loss. We
+    catch, log, back off, and reconnect with exponential backoff capped at
+    WS_RECONNECT_MAX_SECONDS.
   - On successful connect, backoff resets.
-  - Disconnect-window data loss is accepted if the WS doesn't support replay;
-    the Phase 2 working log documents whichever behavior we observe.
-
-Subscription message shape is based on Polymarket US documentation
-(docs.polymarket.us). The actual protocol is verified empirically during
-session 2.1 — if this message format doesn't work, we tune the SUBSCRIBE_
-constants and note the correction in the working log.
+  - Discovery's active slug set is re-read on each (re)connect; if matches
+    have been added/removed since last connect, the new set is picked up.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import uuid
 from typing import Any
 
-import websockets
-from websockets.exceptions import ConnectionClosed, WebSocketException
+from polymarket_us import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncPolymarketUS,
+    AuthenticationError,
+    PolymarketUSError,
+    WebSocketError,
+)
 
 from . import archive
 from .config import (
     MARKETS_WS_SLUG_CAP,
-    MARKETS_WS_URL,
-    USER_AGENT,
+    POLYMARKET_US_API_KEY_ID,
+    POLYMARKET_US_API_SECRET_KEY,
     WS_RECONNECT_FACTOR,
     WS_RECONNECT_INITIAL_SECONDS,
     WS_RECONNECT_MAX_SECONDS,
@@ -48,66 +73,74 @@ from .discovery import DiscoveryLoop
 log = logging.getLogger("capture.sports_ws")
 
 
-# Subscription payload shape. Polymarket US WebSocket protocol documents
-# market_slug as the subscription unit. If the real protocol disagrees, fix
-# these two constants and the build_subscribe_message function.
-SUBSCRIBE_TYPE = "subscribe"
-SUBSCRIBE_CHANNEL = "markets"
-
-
-def build_subscribe_message(slugs: list[str]) -> str:
-    """Build a subscribe frame for up to MARKETS_WS_SLUG_CAP slugs."""
-    payload = {
-        "type": SUBSCRIBE_TYPE,
-        "channel": SUBSCRIBE_CHANNEL,
-        "markets": slugs,
-    }
-    return json.dumps(payload)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def batch_slugs(slugs: list[str], cap: int) -> list[list[str]]:
-    """Partition slugs into sub-cap chunks."""
+    """Partition slugs into sub-cap chunks (documented 100-slug limit)."""
     return [slugs[i : i + cap] for i in range(0, len(slugs), cap)]
 
 
 def extract_slug_from_event(payload: dict[str, Any]) -> str | None:
-    """Pull the market_slug out of an incoming event.
+    """Pull the market_slug out of an inbound payload.
 
-    Tries a few plausible field names because we haven't pinned the exact
-    payload shape yet. Session 2.1 live-run narrows this down and we
-    simplify afterwards.
+    SDK event shapes (from polymarket_us/websocket/markets.py _handle_message):
+      - market_data         → {"marketData": {...}}
+      - market_data_lite    → {"marketDataLite": {...}}
+      - trade               → {"trade": {...}}
+    The `marketSlug` field is inside the inner object. PM-Tennis §14.3
+    confirmed at n=1 that market_data payloads carry `marketSlug`.
     """
-    for field in ("market_slug", "marketSlug", "slug"):
+    for container in ("marketData", "marketDataLite", "trade"):
+        inner = payload.get(container)
+        if isinstance(inner, dict):
+            slug = inner.get("marketSlug") or inner.get("market_slug")
+            if isinstance(slug, str) and slug:
+                return slug
+    # Fallback: top-level
+    for field in ("marketSlug", "market_slug", "slug"):
         val = payload.get(field)
         if isinstance(val, str) and val:
             return val
-    # Some WS protocols nest the identity.
-    for container in ("market", "data", "event"):
-        nested = payload.get(container)
-        if isinstance(nested, dict):
-            found = extract_slug_from_event(nested)
-            if found:
-                return found
     return None
 
 
-class SportsWorker:
-    """Long-running Sports WS capture worker.
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
 
-    Reads current slugs from the DiscoveryLoop on each (re)connect, opens
-    the WS, fans out subscribe messages, and appends every inbound payload
-    to the match's JSONL file.
+
+class SportsWorker:
+    """Long-running Markets WS capture worker (SDK-backed).
+
+    On each (re)connect:
+      1. Read current slugs from DiscoveryLoop.
+      2. Batch into sub-100 groups.
+      3. For each batch, spawn one MarketsWebSocket, register handlers,
+         connect, subscribe to market_data.
+      4. Await until any connection fails; all connections are torn down
+         together; outer loop reconnects after backoff.
     """
 
     def __init__(self, discovery: DiscoveryLoop) -> None:
         self._discovery = discovery
         self._backoff = WS_RECONNECT_INITIAL_SECONDS
+        self._client: AsyncPolymarketUS | None = None
 
     async def run_forever(self) -> None:
-        log.info("Sports WS worker starting; url=%s", MARKETS_WS_URL)
+        log.info("Sports WS worker starting (polymarket-us SDK mode)")
+        if not POLYMARKET_US_API_KEY_ID or not POLYMARKET_US_API_SECRET_KEY:
+            log.error(
+                "POLYMARKET_US_API_KEY_ID and/or POLYMARKET_US_API_SECRET_KEY "
+                "not set. Worker will idle until keys are provided; discovery "
+                "continues unaffected."
+            )
+
+        # Lazy client construction — avoid instantiating without creds.
         while True:
             await self._run_once()
-            # Sleep before retry; backoff grows on repeat failures.
             log.info("Reconnecting in %.1fs…", self._backoff)
             await asyncio.sleep(self._backoff)
             self._backoff = min(
@@ -116,88 +149,149 @@ class SportsWorker:
             )
 
     async def _run_once(self) -> None:
-        """One connect-subscribe-consume lifecycle. Returns when the
-        connection closes or errors."""
+        """One connect-subscribe-consume lifecycle across N batch connections."""
+        if not POLYMARKET_US_API_KEY_ID or not POLYMARKET_US_API_SECRET_KEY:
+            self._backoff = WS_RECONNECT_INITIAL_SECONDS
+            await asyncio.sleep(60)
+            return
+
         slugs = self._discovery.current_slugs()
         if not slugs:
-            # No active matches; wait and try again. Don't escalate backoff.
             log.info("No active slugs to subscribe to; idle for 30s.")
             self._backoff = WS_RECONNECT_INITIAL_SECONDS
             await asyncio.sleep(30)
             return
 
-        batches = batch_slugs(slugs, MARKETS_WS_SLUG_CAP)
-        log.info(
-            "Connecting to Markets WS with %d slugs across %d batch(es).",
-            len(slugs),
-            len(batches),
+        # Build client once per _run_once cycle; close at teardown. This keeps
+        # a stale key_id from haunting reconnects if the operator rotated it.
+        self._client = AsyncPolymarketUS(
+            key_id=POLYMARKET_US_API_KEY_ID,
+            secret_key=POLYMARKET_US_API_SECRET_KEY,
         )
 
+        batches = batch_slugs(slugs, MARKETS_WS_SLUG_CAP)
+        log.info(
+            "Opening %d Markets WS connection(s) for %d slug(s).",
+            len(batches),
+            len(slugs),
+        )
+
+        # Open all WS connections and subscribe each.
+        markets_ws_list: list[Any] = []
+        closed_event = asyncio.Event()
+
         try:
-            async with websockets.connect(
-                MARKETS_WS_URL,
-                user_agent_header=USER_AGENT,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
-            ) as ws:
-                # Reset backoff on successful connect.
+            for batch_idx, batch in enumerate(batches):
+                ws = self._client.ws.markets()
+                self._register_handlers(ws, closed_event, batch_idx)
+                await ws.connect()
+                # Reset backoff the moment the first connection succeeds.
                 self._backoff = WS_RECONNECT_INITIAL_SECONDS
+                request_id = f"md-{uuid.uuid4().hex[:12]}"
+                await ws.subscribe_market_data(request_id, batch)
+                log.info(
+                    "Subscribed batch %d/%d with %d slugs (request_id=%s).",
+                    batch_idx + 1,
+                    len(batches),
+                    len(batch),
+                    request_id,
+                )
+                markets_ws_list.append(ws)
 
-                # Fan out subscribe frames.
-                for batch in batches:
-                    await ws.send(build_subscribe_message(batch))
+            log.info("All batches subscribed; entering idle wait.")
+            # Wait until any connection signals close. The SDK dispatches to
+            # the `close` handler which sets closed_event.
+            await closed_event.wait()
+            log.info("Close signal received; tearing down connections.")
 
-                log.info("Subscribed; entering receive loop.")
-                async for raw_msg in ws:
-                    self._handle_message(raw_msg)
-
-        except (ConnectionClosed, WebSocketException) as exc:
-            log.warning("Markets WS connection ended: %s", exc)
+        except AuthenticationError as exc:
+            log.error(
+                "Markets WS authentication failed — check key_id/secret_key: %s",
+                exc,
+            )
+            # Don't hammer the auth endpoint; longer sleep before retry.
+            self._backoff = max(self._backoff, 30.0)
+        except (
+            APIConnectionError,
+            APITimeoutError,
+            WebSocketError,
+            PolymarketUSError,
+        ) as exc:
+            log.warning("Markets WS connection issue: %s", exc)
         except Exception as exc:  # noqa: BLE001 — loop must survive
             log.exception("Markets WS unexpected error: %s", exc)
+        finally:
+            # Best-effort close of every connection we opened.
+            for ws in markets_ws_list:
+                try:
+                    await ws.close()
+                except Exception:  # noqa: BLE001 — teardown is best-effort
+                    pass
+            if self._client is not None:
+                try:
+                    await self._client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._client = None
 
-    def _handle_message(self, raw_msg: str | bytes) -> None:
-        """Route one incoming payload to the right match's JSONL file.
+    def _register_handlers(
+        self,
+        ws: Any,
+        closed_event: asyncio.Event,
+        batch_idx: int,
+    ) -> None:
+        """Wire all six SDK events to our handlers."""
 
-        Raw preservation rule: store the payload as-received under `raw`,
-        plus minimal routing fields and arrived_at_ms.
+        def _on_market_data(msg: dict[str, Any]) -> None:
+            self._handle_payload("market_data", msg)
+
+        def _on_market_data_lite(msg: dict[str, Any]) -> None:
+            self._handle_payload("market_data_lite", msg)
+
+        def _on_trade(msg: dict[str, Any]) -> None:
+            self._handle_payload("trade", msg)
+
+        def _on_heartbeat(*args: Any, **kwargs: Any) -> None:
+            # Heartbeats are frequent; keep log volume down (debug only).
+            log.debug("Markets WS heartbeat (batch %d)", batch_idx)
+
+        def _on_error(err: Any) -> None:
+            log.warning("Markets WS error event (batch %d): %s", batch_idx, err)
+            self._handle_payload("error", {"error_repr": repr(err)})
+
+        def _on_close(*args: Any, **kwargs: Any) -> None:
+            log.info("Markets WS close event (batch %d)", batch_idx)
+            closed_event.set()
+
+        ws.on("market_data", _on_market_data)
+        ws.on("market_data_lite", _on_market_data_lite)
+        ws.on("trade", _on_trade)
+        ws.on("heartbeat", _on_heartbeat)
+        ws.on("error", _on_error)
+        ws.on("close", _on_close)
+
+    def _handle_payload(self, event_name: str, payload: dict[str, Any]) -> None:
+        """Route one inbound SDK-parsed payload to the right match's JSONL.
+
+        arrived_at_ms is captured at handler entry — as close to SDK-dispatch
+        as we can get. This is what Q2 (lag) comparisons will use against
+        API-Tennis's timestamps.
         """
         recv_ms = archive.arrived_at_ms()
 
-        # Decode once; store the parsed dict under `raw` so analysis
-        # doesn't need to re-parse. If it's not JSON, store the string.
-        payload: Any
-        if isinstance(raw_msg, bytes):
-            try:
-                raw_msg = raw_msg.decode("utf-8")
-            except UnicodeDecodeError:
-                log.warning("Non-UTF-8 Markets WS frame; skipping.")
-                return
-        try:
-            payload = json.loads(raw_msg)
-        except json.JSONDecodeError:
-            log.warning("Non-JSON Markets WS frame; storing as string.")
-            payload = raw_msg
-
-        # Resolve to a match_id via the slug reverse lookup.
-        slug = None
-        if isinstance(payload, dict):
-            slug = extract_slug_from_event(payload)
-
+        slug = extract_slug_from_event(payload) if isinstance(payload, dict) else None
         match_id = self._discovery.match_id_for_slug(slug) if slug else None
 
         record = {
             "arrived_at_ms": recv_ms,
             "source": "polymarket_sports",
+            "event_name": event_name,
             "match_id": match_id,
             "match_id_resolved": bool(match_id),
             "slug": slug,
             "raw": payload,
         }
 
-        # Route: resolved events go to their match's file;
-        # unresolved events go to an _unresolved bucket for operator review.
         date_str = archive.utc_date_str()
         if match_id:
             path = archive.polymarket_sports_path(match_id, date_str)

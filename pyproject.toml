@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "Latency & Validation Study — v1. Observation-only capture of API-Tennis, Polymarket Sports WS, and Polymarket CLOB WS."
 requires-python = ">=3.12"
 dependencies = [
-    "websockets",
     "httpx",
     "orjson",
     "pyyaml",
+    "polymarket-us==0.1.2",
 ]
 
 [project.optional-dependencies]

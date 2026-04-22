@@ -52,13 +52,19 @@ USER_AGENT: str = (
 
 # --- Polymarket Sports (Markets) WebSocket ----------------------------------
 
-# Markets WS endpoint. Subscriptions are by market_slug.
-# Documented cap: 100 slugs per subscription; use multiple subscriptions if more.
-MARKETS_WS_URL: str = os.environ.get(
-    "MARKETS_WS_URL", "wss://ws-subscriptions.polymarket.us/v2/markets"
+# The Markets WS is accessed via the official polymarket-us SDK (pinned 0.1.2
+# in pyproject.toml). URL and Ed25519 handshake signing are handled by the
+# SDK; we only configure credentials and batching.
+
+# Polymarket US API credentials. Ed25519-based auth; key_id is a UUID;
+# secret_key is a base64-encoded Ed25519 private key. Never committed.
+POLYMARKET_US_API_KEY_ID: str = os.environ.get("POLYMARKET_US_API_KEY_ID", "")
+POLYMARKET_US_API_SECRET_KEY: str = os.environ.get(
+    "POLYMARKET_US_API_SECRET_KEY", ""
 )
 
-# Max slugs per single subscription payload (Polymarket documented limit).
+# Max slugs per single subscribe call (Polymarket-documented 100 limit).
+# Larger active sets span multiple connections.
 MARKETS_WS_SLUG_CAP: int = int(os.environ.get("MARKETS_WS_SLUG_CAP", "100"))
 
 # Reconnect backoff: start, cap, factor.
