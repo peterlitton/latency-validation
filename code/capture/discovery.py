@@ -38,6 +38,7 @@ from .config import (
 from .resolver import (
     ResolvedIdentity,
     _extract_event_date,
+    _extract_player_names,
     load_overrides,
     resolve_polymarket_event,
 )
@@ -334,12 +335,9 @@ def _build_meta(
     event_state = event.get("eventState") or {}
     tennis_state = event_state.get("tennisState") or {}
     participants = event.get("participants") or []
-    names = [
-        (p.get("name") or "").strip()
-        for p in participants
-        if isinstance(p, dict)
-    ]
-    names = [n for n in names if n]
+    # Use the same typed-dispatch extraction as the resolver so meta.json's
+    # player_a_name/player_b_name agree with the canonical match_id.
+    names = _extract_player_names(participants)
 
     return {
         "match_id": match_id,

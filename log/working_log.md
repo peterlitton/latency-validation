@@ -135,3 +135,32 @@ Scope changes to the plan are recorded here with a revision note; the plan docum
 - End-to-end live-match verification.
 - Reconnect tests.
 - Close remaining Phase 2 ACs.
+
+---
+
+**Commit 2 (scope refinements + player-extraction fix).**
+
+**Context.** Post-deploy of commit 1, Render logs showed every discovered match had `players=''+''` and a corresponding match_id with a double-underscore gap between tournament and date (e.g. `challenger-abidjan__2026-04-22`). Desk-checked against PM-Tennis's `src/capture/discovery.py` (public repo, read-only reference). Found two things: (a) the US gateway's participant object is a typed wrapper (`{"type": "PARTICIPANT_TYPE_PLAYER", "player": {"name": ...}}`), not a flat `{"name": ...}`; session 2.1's top-level `p.get("name")` extraction silently returned empty names for every participant. (b) Gamma payloads include scheduled-future events across multiple calendar dates; the session 2.1 `active AND NOT closed` filter admitted pre-match events the study doesn't need.
+
+**Scope refinements (operator-raised, not surfaced as bugs).**
+1. **Nominees out of scope.** `PARTICIPANT_TYPE_NOMINEE` events are placeholder participants with no match being played and no third-party feed equivalent; nothing to compare across feeds. Discovery filter rejects them (0 PLAYER participants after typed extraction).
+2. **Scheduled-future matches out of scope.** Study measures event timing during live play; pre-match events generate no comparable WS traffic. Discovery filter rejects on `live=False`. Strict stateless filter; 60s discovery cadence restores subscription on play resumption after delays. Sticky-active-set alternative rejected due to trapped-match failure mode.
+3. **Handicap capture not in scope.** PM-Tennis captures pre-match ticks because its fair-price model needs a handicap; latency study has no fair-price model and no handicap concept. Recorded here to prevent future confusion.
+
+**Worked on.**
+- `resolver.py`: new helper `_extract_player_names` does typed dispatch on `participant["type"]`, extracts only `PARTICIPANT_TYPE_PLAYER` names from `participant["player"]["name"]`. Rewrote `resolve_polymarket_event` rejection order: ended/closed → not live → doubles (>2 PLAYER) → not singles (!=2 PLAYER). Added defensive WARNING tripwire for live two-PLAYER events with empty tournament name (bug #3 hypothesis check — fires if nominee filter doesn't fully resolve bug #3).
+- `discovery.py`: imports and uses the shared `_extract_player_names` helper in `_build_meta` so `meta.json` player names agree with the canonical match_id.
+- `_extract_event_date` kept, including the `eventDate` fallback (defense in depth, per scope call 3).
+- 12 behaviour-test cases run against standalone harness of the extraction + rejection logic; all pass. Cases cover: clean resolve, ended/closed rejection (both orderings), scheduled rejection (explicit `live=False` and missing `live` key), nominee-only, doubles, PLAYER+NOMINEE mix, empty-tournament tripwire, clean-resolve no-warning, PLAYER with empty inner name, TEAM-type participants.
+
+**Decided.**
+- Port participant shape knowledge from PM-Tennis, rewrite the dispatch ourselves. Plan §5.4 reuse boundary — the participant type constants and shape are facts about Polymarket's API, not PM-Tennis IP; the dispatch logic is ours to write. Inline comment in `resolver._extract_player_names` names PM-Tennis as the shape source.
+- Bug #3 (unknown-tournament) expected to resolve as a side effect of the nominee filter; tripwire WARNING confirms or refutes empirically. No separate fix needed.
+- Bug #2 (slug-routing) simplifies indirectly: smaller `_match_slugs` dict, fewer subscriptions. Diagnosis still required but the surface area shrinks.
+- Migration stays paused. Commit 2 deploys first; after a poll cycle confirms new match_ids have both tournament and player slugs populated correctly, then the migration can run against the (now correctly-populated) `_unknown-date` directories.
+
+**Next.**
+- Deploy commit 2. Watch logs for: (a) fewer discovered matches (live-only filter), (b) real player names in discovery log lines, (c) no tripwire WARNINGs firing. If tripwire fires, surface before proceeding.
+- Run migration once dated `_unknown-date` directories have correctly-formed successors; see commit 1's Next.
+- Bug #2 diagnosis from the now-smaller active set.
+- Remaining scope unchanged: CLOB WS, end-to-end verification, reconnect tests, Phase 2 ACs.

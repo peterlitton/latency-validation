@@ -171,11 +171,54 @@ def _extract_event_date(event: dict[str, Any]) -> str:
 
     The `[:10]` slice handles both ISO-8601 with time (`"2026-04-22T13:00:00Z"`)
     and plain-date (`"2026-04-22"`) inputs.
+
+    The `eventDate` fallback is retained as defense in depth (session 2.2
+    decision): once the live-only filter is in place, `startDate` should
+    always be populated, but the fallback protects against malformed-response
+    failure modes that silently produced `_unknown-date` suffixes in 2.1.
     """
     raw = event.get("startDate") or event.get("eventDate") or ""
     if not isinstance(raw, str):
         return ""
     return raw[:10]
+
+
+# Participant-type discriminator used on the Polymarket US gateway.
+# Discovered by reading PM-Tennis's discovery._extract_player_names (the shape
+# is a fact about the US gateway's payload, not PM-Tennis IP). The participant
+# is a typed wrapper: top-level `type` tells us which nested sub-object carries
+# the name. Only PLAYER participants are in scope for the latency study — see
+# session 2.2 scope decision on nominees.
+PARTICIPANT_TYPE_PLAYER = "PARTICIPANT_TYPE_PLAYER"
+
+
+def _extract_player_names(participants: list[Any]) -> list[str]:
+    """Return player names from participants, PLAYER-type only.
+
+    The US gateway's participant object is shaped like:
+        {"type": "PARTICIPANT_TYPE_PLAYER", "player": {"name": "...", ...}}
+
+    Our previous implementation read `p.get("name")` at the top level, which
+    is always empty on the US gateway. Non-PLAYER types (NOMINEE, TEAM) carry
+    their names under different keys, but v1 scope is live singles matches
+    only — nominees are placeholder participants without a match being played
+    and teams don't appear in tennis singles — so they are deliberately not
+    extracted here. An event with zero PLAYER participants will fail the
+    downstream singles check and be rejected.
+    """
+    names: list[str] = []
+    for p in participants:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") != PARTICIPANT_TYPE_PLAYER:
+            continue
+        player = p.get("player") or {}
+        if not isinstance(player, dict):
+            continue
+        name = (player.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
 
 
 def resolve_polymarket_event(
@@ -184,9 +227,25 @@ def resolve_polymarket_event(
 ) -> ResolvedIdentity:
     """Given a raw Gamma event object, produce a ResolvedIdentity.
 
-    Uses the event's metadata fields (tournamentName, participants, startDate).
-    Doubles and already-ended events are rejected. Anything else either
-    resolves cleanly or gets flagged for override.
+    Scope (v1): live singles tennis matches only.
+
+    Rejection order (first match wins; keeps log reasons unambiguous):
+      1. Ended or closed — event is done.
+      2. Not currently live — scheduled-future or pre-match; out of scope
+         per session 2.2 scope decision. v1 research questions compare
+         event timing during live play, so pre-match events generate no
+         comparable WS traffic.
+      3. Doubles/mixed — more than two PLAYER-typed participants.
+      4. Not a recognisable singles match — anything other than exactly
+         two PLAYER-typed participants (covers nominee-only events,
+         malformed payloads, and solo placeholder events). Nominee-only
+         events are the main expected case and are out of scope by
+         session 2.2 decision.
+
+    Live singles with two PLAYER participants either resolve cleanly or
+    get flagged (missing tournament name, etc.) — flagged events are
+    still captured, with the flag recorded in meta.json for operator
+    review.
     """
     # Extract fields defensively — the gateway response shape has enough
     # nested optionality to warrant it.
@@ -195,38 +254,46 @@ def resolve_polymarket_event(
     tournament = tennis_state.get("tournamentName") or ""
 
     participants = event.get("participants") or []
-    player_names = [
-        (p.get("name") or "").strip() for p in participants if isinstance(p, dict)
-    ]
-    player_names = [n for n in player_names if n]
-
+    player_names = _extract_player_names(participants)
     event_date = _extract_event_date(event)
 
-    # Rejections.
+    # --- Rejections ---
+
     if event.get("ended") or event.get("closed"):
         return ResolvedIdentity(
             match_id=None, status="rejected", reason="event ended or closed"
         )
+
+    # Live-only filter (session 2.2 scope decision). `live` is a top-level
+    # boolean on Gamma events; scheduled-but-not-yet-live events return
+    # False here. Strict stateless filter: on transient `live=False` during
+    # delays, the event drops from the active set; the next poll (60s)
+    # restores it if play resumes. Option 2 (sticky set) rejected due to
+    # the trapped-match failure mode if `ended` never fires cleanly.
+    if not bool(event.get("live")):
+        return ResolvedIdentity(
+            match_id=None, status="rejected", reason="not live"
+        )
+
     if len(player_names) > 2:
         return ResolvedIdentity(
             match_id=None,
             status="rejected",
-            reason=f"doubles/mixed ({len(player_names)} participants)",
+            reason=f"doubles/mixed ({len(player_names)} PLAYER participants)",
         )
 
-    if len(player_names) < 2:
-        # Not enough info to build a canonical ID. Flag but don't reject —
-        # metadata may fill in later.
-        fallback = canonical_match_id(
-            tournament,
-            player_names[0] if player_names else "",
-            "",
-            event_date,
-        )
+    if len(player_names) != 2:
+        # Either zero (likely nominee-only event, out of scope) or one
+        # (malformed payload). Reject rather than flag — a valid live
+        # singles match must have exactly two PLAYER-typed participants.
         return ResolvedIdentity(
-            match_id=fallback,
-            status="flagged",
-            reason=f"only {len(player_names)} participants in Gamma payload",
+            match_id=None,
+            status="rejected",
+            reason=(
+                f"not a recognisable singles match "
+                f"({len(player_names)} PLAYER participants; "
+                f"{len(participants)} total)"
+            ),
         )
 
     mid = canonical_match_id(
@@ -245,11 +312,24 @@ def resolve_polymarket_event(
                     match_id=mapped, status="resolved", reason="override"
                 )
 
-    if not tournament or not player_names[0] or not player_names[1]:
+    # Defensive tripwire: a live two-PLAYER event with missing tournament
+    # name is unexpected post-nominee-filter. Session 2.2 hypothesis: bug #3
+    # (unknown-tournament) was caused by nominee events, and the live-only +
+    # PLAYER-only filters above should eliminate them entirely. If this
+    # WARNING fires, the hypothesis was wrong and there's another shape
+    # variant to investigate. Zero-cost insurance.
+    if not tournament:
+        log.warning(
+            "Live two-PLAYER event has empty tournamentName: "
+            "event_id=%s title=%r — bug #3 hypothesis may be incomplete",
+            event.get("id"),
+            event.get("title"),
+        )
         return ResolvedIdentity(
             match_id=mid,
             status="flagged",
-            reason="missing tournament or player name",
+            reason="missing tournament name on live match (unexpected)",
         )
 
     return ResolvedIdentity(match_id=mid, status="resolved")
+
