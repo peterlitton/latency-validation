@@ -227,7 +227,6 @@ class DiscoveryLoop:
     async def run_once(self) -> None:
         """Execute one poll cycle. Never raises; errors go to the log."""
         poll_ts = archive.utc_iso_now()
-        date_str = archive.utc_date_str()
 
         # Pick up any newly-added overrides without restarting.
         self._overrides = load_overrides()
@@ -241,12 +240,15 @@ class DiscoveryLoop:
             log.error("Gateway unreachable during poll: %s", exc)
             return
 
-        # Archive the raw response before anything else can fail.
-        snap_path = archive.gamma_snapshot_path(date_str)
-        for ev in raw_events:
-            archive.append_jsonl(
-                snap_path, {"poll_ts": poll_ts, "event": ev}
-            )
+        # Session 2.2 commit 6: gamma/ snapshot writes removed.
+        # Rationale: raw Gamma snapshots were writing ~900 MB/day to disk
+        # while serving no research question. Q1-Q3 use event-stream data
+        # from polymarket_sports/ + API-Tennis. Q4's discovery-signal needs
+        # are served by per-match discovery_delta.jsonl (added/removed
+        # transitions), written below. Keeping every event from every poll
+        # filled Render's 1 GB disk in under a day. The snapshot write
+        # used to happen here; removed. If a future session needs raw
+        # Gamma data for diagnostics, re-enable temporarily.
 
         # Build the new active set.
         new_active: dict[str, dict[str, Any]] = {}

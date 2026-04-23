@@ -261,3 +261,34 @@ No fix needed. Bug closed with empirical understanding recorded.
 - Deploy commit 5. Confirm trades subscription starts producing `event_name=trade` records in match JSONLs when live tennis resumes.
 - Operator: run §A and §C procedures on next live match window. Append results.
 - Phase 3 kickoff: activate API-Tennis Business tier trial, build API-Tennis WS worker. Phase 3 triggers the 14-day measurement window clock.
+
+---
+
+**Commit 6: disk exhaustion, gamma/ snapshots removed.**
+
+Post-commit-5 deploy landed during a live window with 6+ live matches. Service immediately started crashing on every poll: `OSError: [Errno 28] No space left on device`. `df -h /data` showed 974 MB disk at 100% used. `du -sh` breakdown:
+- `gamma/`: 900 MB
+- `polymarket_sports/`: 58 MB
+- `matches/`: 268 KB
+
+The `gamma/` directory was consuming 99% of disk. Discovery's `run_once` wrote every Gamma event from every poll to `gamma/{YYYY-MM-DD}.jsonl` — ~95 events × 60 polls/hour × ~8 KB/event = ~1 GB/day. Session 2.1 + session 2.2 continuous operation filled a day of free-tier disk.
+
+**Research-question relevance check.** The `gamma/` snapshots don't feed Q1–Q4. Live-phase event data comes from `polymarket_sports/`. Discovery signal for Q4 (match add/remove transitions) is already captured in per-match `discovery_delta.jsonl` files under `matches/`. Raw Gamma polls were a "just in case" archive with no identified use.
+
+**Action taken:**
+1. Operator compressed `2026-04-22.jsonl` (the day with the best live-match coverage) to `.gz` and downloaded to Mac for optional future use. Source-of-truth data is on Mac; capture-host copy will be deleted.
+2. Deleted `/data/archive/gamma/*` contents on Render Shell. Disk usage dropped from 100% to ~6%.
+3. Code change: removed the `archive.append_jsonl(snap_path, ...)` write from `discovery.run_once`. Removed the now-unused `date_str` local. Comment block in place of the removed code documents why — future operator can reinstate temporarily for diagnostic purposes if ever needed.
+
+**What was preserved.** Per-match `discovery_delta.jsonl` writes retained — those record added/removed match transitions in a fraction of the space (one line per change, not one line per event per poll), and they do serve Q4 reliability analysis.
+
+**Plan touch.** None. Plan §10 lists "archive backup target and cadence" as a deferred implementation decision, not a preservation mandate. Plan §11 done-criterion #3 is "archive backed up to at least one off-host location" at end of v1 — refers to the final analysis archive, not raw polls. No plan revision needed; this is within the implementation-decision envelope.
+
+**Data loss window.** Between commit-5 deploy (~13:42 UTC 2026-04-23) and disk-cleared restart, ~N minutes of Sports WS trade/market_data events for ~6 live matches were dropped at the `append_jsonl` call. Not recoverable. Q1–Q4 analysis has a 14-day window that hasn't started; impact is zero. Phase 2 AC verification runs get re-scheduled to next live window.
+
+**Bug #4 reminder.** Sports WS reconnect-when-empty loop still parked. Unrelated to commit 6.
+
+**Next.**
+- Deploy commit 6. Verify discovery loop stops writing to `gamma/` (the directory should stay empty after restart even as polls run).
+- Run Phase 2 acceptance tests (§A reconnect, §C end-to-end) on current live window — acceptance tests were blocked by the disk issue, now unblocked.
+- Phase 3 kickoff unchanged.
