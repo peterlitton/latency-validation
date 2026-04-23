@@ -423,3 +423,84 @@ Files:
 
 **Standing risks from session 2.2 still live:**
 - Render tier upgrade before full Phase 3 measurement window. Still Starter tier unless you've upgraded since. Recommend confirming upgrade before committing the 14-day trial budget.
+
+---
+
+**Commit 10: session 3.1 close.**
+
+Log-only commit.
+
+**Smoke-test pass.** Bittoun-Kouzmine vs Chazal (Challenger Abidjan) captured simultaneously from all three data sources during live play:
+
+| Source | Path | Signal |
+|---|---|---|
+| API-Tennis WS | `/data/archive/api_tennis/challenger-abidjan_constantin-bittoun-kouzmine_maxime-chazal_2026-04-23/2026-04-23.jsonl` | Game events, scores, pointbypoint, statistics |
+| Polymarket Markets WS (`market_data`) | `/data/archive/polymarket_sports/challenger-abidjan_constantin-bittoun-kouzmine_maxime-chazal_2026-04-23/2026-04-23.jsonl` (event_name=market_data) | CLOB order book deltas |
+| Polymarket Markets WS (`trade`) | same file as above (event_name=trade) | Trade executions |
+
+All routing through canonical `match_id = challenger-abidjan_constantin-bittoun-kouzmine_maxime-chazal_2026-04-23`. meta.json in `/data/archive/matches/{match_id}/`. Evidence: first post-restart API-Tennis record shows `match_id_resolved: True`, `event_key: 12121255`, matching the override's target match_id exactly.
+
+Routing flow verified:
+1. Operator added `12121255: challenger-abidjan_constantin-bittoun-kouzmine_maxime-chazal_2026-04-23` to `/data/archive/cross_feed_overrides.yaml`
+2. Restart Service triggered SIGTERM → graceful shutdown → new process
+3. `capture.cross_feed — Loaded 1 cross-feed override(s)` logged at 19:47:52 UTC
+4. `capture.api_tennis_ws — Opening API-Tennis WS (1 override(s) loaded)` confirmed file read
+5. Within 30s of reconnect, new directory `challenger-abidjan_constantin-bittoun-kouzmine_maxime-chazal_2026-04-23/` appeared under `api_tennis/` alongside `_unresolved/`
+6. Tail record in new dir had `match_id_resolved: True`, `event_key: 12121255`
+
+**Phase 3 AC target: met.** Plan §6 Phase 3 called for "all three sources capturing one match simultaneously." Done. Empirical reinterpretation applies: three sources are API-Tennis, Polymarket `market_data`, Polymarket `trade` — not the plan's original "Sports WS vs CLOB WS" conceptual split (session 3.1 probe findings confirmed that distinction doesn't map to the SDK reality).
+
+**Render tier upgrade: done 2026-04-23 13:07 UTC.** Service on Standard before API-Tennis worker deploy; the 512 MB OOM risk flagged in session 2.2 is no longer live. Session 2.2's standing risk list can be closed accordingly.
+
+**Plan revision queued.** §4 (WebSocket auth description mentions "Sports WS" and "CLOB WS" as distinct endpoints) and §6 Phase 3 AC language ("three sources" with implicit plan-level interpretation) both need updating to reflect the empirical two-endpoint / three-subscription-type reality. Low urgency — cosmetic / forward-compatibility concern only, no code depends on plan language. Queued for next substantive session.
+
+**Curation workflow for ongoing matches (reference for session 3.2+).**
+
+As Madrid Open matches (and other Challenger/main-tour matches) appear over the next 10 days, each needs one line added to `cross_feed_overrides.yaml` to route its API-Tennis stream to the Polymarket-owned match_id directory.
+
+Standard curation cycle (~2 minutes per match):
+
+1. Identify Polymarket match_id from logs: look for recent `Discovered match ...` lines in Render Logs. Copy the full match_id string (format: `{tournament-slug}_{player-a-slug}_{player-b-slug}_{YYYY-MM-DD}`).
+
+2. Identify API-Tennis event_key for same match. On Render Shell:
+   ```bash
+   python3 -c "
+   import httpx, os
+   r = httpx.get(
+     'https://api.api-tennis.com/tennis/',
+     params={'method': 'get_livescore', 'APIkey': os.environ['API_TENNIS_KEY']},
+     timeout=15,
+   )
+   for e in r.json().get('result', []):
+     name_a = e.get('event_first_player') or ''
+     name_b = e.get('event_second_player') or ''
+     if '<SURNAME>' in name_a or '<SURNAME>' in name_b:
+       print(e['event_key'], e.get('tournament_name'), name_a, 'vs', name_b, e.get('event_status'))
+   "
+   ```
+   Substitute `<SURNAME>` with one of the players. Returns matching event_keys plus their tournament context for disambiguation.
+
+3. Append the mapping:
+   ```bash
+   echo "<event_key>: <polymarket_match_id>" >> /data/archive/cross_feed_overrides.yaml
+   ```
+
+4. Force reconnect (fastest path) or wait for the next natural one. Manual Deploy → Restart Service does the job in ~10s including graceful shutdown.
+
+5. Verify routing: `ls /data/archive/api_tennis/` shows the new match directory; `tail -1` that dir's JSONL confirms `match_id_resolved: True` with the expected `event_key`.
+
+Previously-captured events for that event_key (sitting in `_unresolved/` before the override was added) are not retroactively moved — Phase 7 analysis joins on `event_key` rather than trusting directory placement, same pattern as the session 2.2 Phase 7 analysis note for Polymarket's `_unresolved/`.
+
+**Open for session 3.2+ (updated):**
+- Plan §4 / §6 language revision to match three-source empirical reality.
+- Operator-side curation of overrides for ongoing Madrid matches over next ~10 days. Self-service per the workflow above; no blocker on capture-layer code.
+- Post-match check procedures for API-Tennis source.
+- Reconnect test for API-Tennis WS.
+- Phase 3 close-out AC table once N matches captured end-to-end across all three sources. Exact N TBD — one match satisfies the AC literally, but a handful gives more confidence that the pattern scales.
+
+**Session 2.2 standing risks: all closed or reclassified.**
+- Tier upgrade: done (2026-04-23 13:07 UTC). OOM risk no longer live.
+- Diagnostic streaming rewrite: still deferred post-Phase-7. No change.
+- Bug #4 (reconnect-when-empty loop): still parked. No change.
+
+**End of session 3.1.**
