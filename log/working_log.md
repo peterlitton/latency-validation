@@ -315,3 +315,41 @@ Pattern, third time: unverified schema assumption caused a silent-filter-out bug
 - Deploy commit 7.
 - Re-run acceptance-test step 1 (Poll complete with `active > 0`).
 - Then steps 2-5 per the earlier sequence.
+
+---
+
+**Commit 8: Phase 2 close.**
+
+All six Phase 2 ACs met. Full acceptance-test runbook executed against live data on 2026-04-23.
+
+**AC closeout evidence.**
+
+| AC (plan §6 / session 2.1 log) | Status | Evidence |
+|---|---|---|
+| Discovery loop runs 1+ hr, non-empty polls, meta.json written | Met | Continuous polls 14:43 UTC onward across session 2.2, 2+ hours of clean runtime. 33 meta.json files in archive, all with correct schema post-commit-7. |
+| Sports WS worker runs 1+ hr live | Met | Active throughout post-commit-7 window; 20k+ events routed across 7+ concurrent matches this afternoon. |
+| Raw JSONL with `arrived_at_ms` and `match_id` | Met | All records post-commit-2 carry both fields, `match_id_resolved: true` for live-phase events, strictly monotonic `arrived_at_ms` within each match. |
+| End-to-end live match | Met | Aryna Sabalenka vs Peyton Stearns, Madrid Open Round of 64, 2026-04-23. Discovered 14:43:00 UTC, captured through match end (~14:57 UTC settlement phase). meta.json clean with full SportsDataIO provenance, WTA rankings, participant colour primaries. 1,900 events in match JSONL: 1,810 market_data + 90 trade. Single slug `aec-wta-arysab-peyste-2026-04-22` on all 1,900 records — zero cross-match contamination. Market state `MARKET_STATE_OPEN` with visible bids-side order book throughout; Sabalenka moved from 0.94 → 0.99 implied probability across the live window with $190K notional traded. Trade subscription verified flowing at ~5% of market_data volume (consistent with normal tennis moneyline flow). Zero WARNING lines anywhere in logs across 23+ minutes post-deploy. |
+| Reconnect test | Met | Manual restart triggered 16:40:06 UTC. Clean SIGTERM → graceful shutdown sequence (both supervisors cancelled, orchestrator stopped) → 10s gap → service live → first poll `active=5 added=5 removed=0` (all 5 live matches rediscovered) → Sports WS resubscribe to 7 slugs with both `market_data=md-...` and `trades=tr-...` request IDs → Savannah Challenger resumed writing events at 16:41:17 UTC (204s gap from pre-restart 16:37:53 last event, service-down component ~10s, rest is poll-interval lag and resubscribe delay). Post-restart `arrived_at_ms` strictly > pre-restart, no duplicates, event_name preserved. |
+| Discovery reconnect on crash | Met by code review | `orchestrator.supervise()` catches all non-CancelledError exceptions, logs, sleeps `WORKER_RESTART_DELAY_SECONDS` (5s default), and relaunches the worker coroutine via factory. Confirmed behaviour empirically during earlier commit-6 deploy cycle (not a research-question-critical test; code review sufficient). |
+
+**§C step 9 (diagnostic) not run.** Diagnostic script loads all JSONL events into memory; during testing it triggered 7 consecutive OOM crashes of the capture service (Starter tier 512 MB cap). Skipped as non-essential for AC closeout since §C steps 2-8 all passed and the data-layer correctness is empirically verified. Diagnostic stays available for post-measurement forensic use; streaming rewrite deferred to post-Phase-7 per operator decision.
+
+**Operational flags recorded for Phase 3.**
+
+1. **Render tier upgrade: Phase 3 hard prerequisite.** Service ran out of memory 7 times during diagnostic testing. Starter tier's 512 MB cap is insufficient headroom for capture + any operational tooling. OOM during the 14-day measurement window would waste the $80 API-Tennis Business trial and invalidate data across multiple matches. Upgrade to Standard (or higher) before the Phase 3 trigger fires. Treat as a blocking prerequisite, not a nice-to-have.
+
+2. **Diagnostic script: streaming rewrite deferred to post-Phase-7.** Problem doesn't exist during measurement (we don't run diagnostics during live capture). Current script is fine for between-phase forensic use when capture is off. Rewrite when Phase 7 analysis tooling gets its own sweep.
+
+3. **Bug #4 (Sports WS reconnect-when-empty 30s loop): parked.** Cosmetic log noise, not data-losing. Tightening is trivial but doesn't serve a research question.
+
+**Archive state at Phase 2 close.** `/data/archive/` uses 60 MB of 974 MB (6%). Three trees:
+- `matches/`: 33 dirs, per-match meta.json + discovery_delta.jsonl (Q4 discovery-signal channel).
+- `polymarket_sports/`: 33 dirs, per-match {YYYY-MM-DD}.jsonl event archives plus `_unresolved/` (post-match settlement artifacts, mechanism understood, analysis-safe per Phase 7 note).
+- `gamma/`: empty, write removed in commit 6. Will stay empty.
+
+Six `_unknown-date` orphan dirs remain from session-2.1-era captures (pre-commit-2 participant-shape bug). No cleanup performed per standing instruction — they don't serve research questions.
+
+**Phase 3 unblocked pending tier upgrade.** Activate API-Tennis Business trial (triggers 14-day measurement clock), build API-Tennis WS worker, resume comparative capture.
+
+**End of session 2.2.**
