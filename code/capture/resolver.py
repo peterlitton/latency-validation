@@ -183,39 +183,50 @@ def _extract_event_date(event: dict[str, Any]) -> str:
     return raw[:10]
 
 
-# Participant-type discriminator used on the Polymarket US gateway.
-# Discovered by reading PM-Tennis's discovery._extract_player_names (the shape
-# is a fact about the US gateway's payload, not PM-Tennis IP). The participant
-# is a typed wrapper: top-level `type` tells us which nested sub-object carries
-# the name. Only PLAYER participants are in scope for the latency study — see
-# session 2.2 scope decision on nominees.
+# Participant-type discriminators used on the Polymarket US gateway.
+# Both PLAYER and TEAM appear on tennis singles matches empirically:
+# session 2.2 captured 20k+ events across PLAYER-typed matches, then
+# during commit 6's live-window verification encountered 7 active TEAM-
+# typed matches where Gamma uses `participant["team"]["name"]` for the
+# player name. Session 2.2 scope accepts either as a "player" for
+# match-id purposes; nominees remain out of scope (placeholder
+# participants for unresolved draw positions, no match being played).
 PARTICIPANT_TYPE_PLAYER = "PARTICIPANT_TYPE_PLAYER"
+PARTICIPANT_TYPE_TEAM = "PARTICIPANT_TYPE_TEAM"
 
 
 def _extract_player_names(participants: list[Any]) -> list[str]:
-    """Return player names from participants, PLAYER-type only.
+    """Return player names from participants, PLAYER or TEAM type.
 
-    The US gateway's participant object is shaped like:
-        {"type": "PARTICIPANT_TYPE_PLAYER", "player": {"name": "...", ...}}
+    The US gateway uses a typed-wrapper shape for participants:
+        {"type": "PARTICIPANT_TYPE_PLAYER", "player": {"name": "..."}}
+        {"type": "PARTICIPANT_TYPE_TEAM",   "team":   {"name": "..."}}
+        {"type": "PARTICIPANT_TYPE_NOMINEE", ...}    ← out of scope
 
-    Our previous implementation read `p.get("name")` at the top level, which
-    is always empty on the US gateway. Non-PLAYER types (NOMINEE, TEAM) carry
-    their names under different keys, but v1 scope is live singles matches
-    only — nominees are placeholder participants without a match being played
-    and teams don't appear in tennis singles — so they are deliberately not
-    extracted here. An event with zero PLAYER participants will fail the
+    Empirically both PLAYER and TEAM types appear on tennis singles
+    matches (why Gamma uses two types for the same conceptual entity is
+    not documented; the two types have been observed within the same
+    session). Both are treated as "player" for match-id construction —
+    the nested `.name` field is the real player name in both cases.
+    Nominees remain out of scope per session 2.2 scope decision.
+
+    An event with zero PLAYER-or-TEAM participants will fail the
     downstream singles check and be rejected.
     """
     names: list[str] = []
     for p in participants:
         if not isinstance(p, dict):
             continue
-        if p.get("type") != PARTICIPANT_TYPE_PLAYER:
+        p_type = p.get("type")
+        if p_type == PARTICIPANT_TYPE_PLAYER:
+            inner = p.get("player") or {}
+        elif p_type == PARTICIPANT_TYPE_TEAM:
+            inner = p.get("team") or {}
+        else:
             continue
-        player = p.get("player") or {}
-        if not isinstance(player, dict):
+        if not isinstance(inner, dict):
             continue
-        name = (player.get("name") or "").strip()
+        name = (inner.get("name") or "").strip()
         if name:
             names.append(name)
     return names
@@ -235,17 +246,17 @@ def resolve_polymarket_event(
          per session 2.2 scope decision. v1 research questions compare
          event timing during live play, so pre-match events generate no
          comparable WS traffic.
-      3. Doubles/mixed — more than two PLAYER-typed participants.
+      3. Doubles/mixed — more than two PLAYER-or-TEAM-typed participants.
       4. Not a recognisable singles match — anything other than exactly
-         two PLAYER-typed participants (covers nominee-only events,
-         malformed payloads, and solo placeholder events). Nominee-only
-         events are the main expected case and are out of scope by
-         session 2.2 decision.
+         two PLAYER-or-TEAM-typed participants (covers nominee-only
+         events, malformed payloads, and solo placeholder events).
+         Nominee-only events are the main expected case and are out of
+         scope by session 2.2 decision.
 
-    Live singles with two PLAYER participants either resolve cleanly or
-    get flagged (missing tournament name, etc.) — flagged events are
-    still captured, with the flag recorded in meta.json for operator
-    review.
+    Live singles with two PLAYER-or-TEAM participants either resolve
+    cleanly or get flagged (missing tournament name, etc.) — flagged
+    events are still captured, with the flag recorded in meta.json for
+    operator review.
     """
     # Extract fields defensively — the gateway response shape has enough
     # nested optionality to warrant it.
@@ -279,19 +290,19 @@ def resolve_polymarket_event(
         return ResolvedIdentity(
             match_id=None,
             status="rejected",
-            reason=f"doubles/mixed ({len(player_names)} PLAYER participants)",
+            reason=f"doubles/mixed ({len(player_names)} player/team participants)",
         )
 
     if len(player_names) != 2:
         # Either zero (likely nominee-only event, out of scope) or one
         # (malformed payload). Reject rather than flag — a valid live
-        # singles match must have exactly two PLAYER-typed participants.
+        # singles match must have exactly two PLAYER-or-TEAM participants.
         return ResolvedIdentity(
             match_id=None,
             status="rejected",
             reason=(
                 f"not a recognisable singles match "
-                f"({len(player_names)} PLAYER participants; "
+                f"({len(player_names)} player/team participants; "
                 f"{len(participants)} total)"
             ),
         )
@@ -312,15 +323,16 @@ def resolve_polymarket_event(
                     match_id=mapped, status="resolved", reason="override"
                 )
 
-    # Defensive tripwire: a live two-PLAYER event with missing tournament
-    # name is unexpected post-nominee-filter. Session 2.2 hypothesis: bug #3
-    # (unknown-tournament) was caused by nominee events, and the live-only +
-    # PLAYER-only filters above should eliminate them entirely. If this
-    # WARNING fires, the hypothesis was wrong and there's another shape
-    # variant to investigate. Zero-cost insurance.
+    # Defensive tripwire: a live singles event with two player/team
+    # participants but a missing tournament name is unexpected post-
+    # nominee-filter. Session 2.2 hypothesis: bug #3 (unknown-tournament)
+    # was caused by nominee events, and the live-only + PLAYER/TEAM-only
+    # filters above should eliminate them entirely. If this WARNING
+    # fires, the hypothesis was wrong and there's another shape variant
+    # to investigate. Zero-cost insurance.
     if not tournament:
         log.warning(
-            "Live two-PLAYER event has empty tournamentName: "
+            "Live singles event has empty tournamentName: "
             "event_id=%s title=%r — bug #3 hypothesis may be incomplete",
             event.get("id"),
             event.get("title"),

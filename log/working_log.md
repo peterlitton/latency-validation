@@ -292,3 +292,26 @@ The `gamma/` directory was consuming 99% of disk. Discovery's `run_once` wrote e
 - Deploy commit 6. Verify discovery loop stops writing to `gamma/` (the directory should stay empty after restart even as polls run).
 - Run Phase 2 acceptance tests (§A reconnect, §C end-to-end) on current live window — acceptance tests were blocked by the disk issue, now unblocked.
 - Phase 3 kickoff unchanged.
+
+---
+
+**Commit 7: TEAM participants accepted.**
+
+Commit 6 deployed, gamma writes stopped, disk clean. Acceptance-test step 1 (commit 2 four-indicator check) surfaced `active=0` across six polls. Initial read: live window passed. Operator pushed back — phone showed 5 live matches. Empirical probe against `gateway.polymarket.us/v2/sports/tennis/events` confirmed 7 events with `live=True`. Our resolver was rejecting all of them.
+
+**Root cause.** `_extract_player_names` only accepted `PARTICIPANT_TYPE_PLAYER`. The active live events came back with `PARTICIPANT_TYPE_TEAM` — each participant wrapped with a `team` sub-object containing the player name at `team.name`. Session 2.2's `_extract_player_names` docstring explicitly said "teams don't appear in tennis singles — so they are deliberately not extracted here." That claim was empirically wrong. TEAM-typed participants do appear on singles matches on the US gateway.
+
+The call to read PM-Tennis's `_extract_player_names` (which handles PLAYER, NOMINEE, and TEAM) and port only the PLAYER branch was the error. The commit 2 narrative said teams don't appear in tennis singles; should have been empirical — PM-Tennis handles TEAM for a reason.
+
+**Fix.** `_extract_player_names` now accepts both PLAYER and TEAM via typed dispatch, reading `.name` from the corresponding nested sub-object. NOMINEE remains out of scope. Six-case standalone test confirms extraction is correct (TEAM pair, PLAYER pair, nominee-only rejected, mixed PLAYER+TEAM, incomplete team filtered, null inner dict filtered).
+
+**Why this wasn't caught in session 2.1 or 2.2 earlier.** Session 2.1 routed 20k events correctly — those matches apparently returned PLAYER type. Today's live batch returned TEAM type. Gamma's schema choice is non-deterministic from our vantage point; a single event's `type` can apparently flip between PLAYER and TEAM across time or between matches. Session 2.2 captured 20k+ PLAYER events, accepted a PLAYER-only filter, and never saw a TEAM event during the deploy/verify cycle (all pre-commit-7 verification runs happened when Gamma was returning PLAYER — possibly because there were fewer live matches at those times and the PLAYER-typed matches happened to be active).
+
+Pattern, third time: unverified schema assumption caused a silent-filter-out bug. Session 2.2 hit this for (1) eventDate field name, (2) top-level participant name vs nested, (3) now TEAM vs PLAYER wrapping. Lesson standing: schema probes against live Gamma responses should happen at session-open and after any live-data anomaly, not be backfilled from hypotheses.
+
+**Phase 2 AC impact.** Acceptance-test runbook unchanged. Commit 7 deploys, discovery resumes finding live matches, then §A reconnect and §C end-to-end can proceed. No prior ACs regress.
+
+**Next.**
+- Deploy commit 7.
+- Re-run acceptance-test step 1 (Poll complete with `active > 0`).
+- Then steps 2-5 per the earlier sequence.
