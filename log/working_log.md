@@ -202,3 +202,62 @@ Considered and rejected: a v3 migration to quarantine the orphan `_unknown-date`
 - Deploy commit 4. Run diagnostic. Paste output for bug #2 analysis.
 - Bug #2 fix in code.
 - CLOB WS, end-to-end verification, reconnect tests, Phase 2 ACs.
+
+---
+
+**Bug #2: CLOSED — mechanism understood, not a problem for the study.**
+
+Diagnostic ran against the real archive (~20k routed events, ~4.4k in _unresolved). Session 2.1's framing of the bug was wrong. Observed reality:
+
+- 11 of 16 currently-known matches have zero events in `_unresolved`. Routing works fine for them.
+- 4,387 of 4,391 `_unresolved` events are for slugs with NO currently-known owner in any meta.json. The single biggest (3,898 events, `aec-atp-ilisim-sookwo-2026-04-21`) is from a match dated 2026-04-21 — ended before session 2.2's first poll. Discovery dropped it from the active set; the Sports WS kept receiving post-end settlement events; reverse lookup (`match_id_for_slug`) failed because the slug had been removed from `_match_slugs`; events went to `_unresolved`.
+- 4 events in `_unresolved` do have a currently-known owner: `aec-atp-andrub-vitkop-2026-04-23` → `madrid-open_2026-04-24`. This is the cross-day subscription-transition edge case, tiny signal.
+
+Mechanism: the reverse slug→match_id lookup uses *current* state, not state-at-event-time. Matches that end mid-session produce a tail of post-end events (order-book settlement, clearing trades) that flow in faster than discovery removes the subscription, and those events fail the reverse lookup. Also produces the cross-match contamination seen in the diagnostic: 7 events (0.03% of total) in the wrong dir because slug ownership shifted between matches before the subscription updated.
+
+Why this isn't a study problem: Q1–Q3 analyze live-phase events only. Post-end events aren't on the API-Tennis side (API-Tennis stops streaming at match end), so there's nothing to compare. Q4 (reliability) could in principle use "late-arriving post-end events" as a signal but the study's comparison scope is during-play, not after-end. The matches that matter — high-volume, live-phase, still active at archive time — route correctly.
+
+No fix needed. Bug closed with empirical understanding recorded.
+
+**Phase 7 analysis note.** Analysis notebooks must verify slug ownership by consulting each match's `meta.json[moneyline_market_slugs]`, not by trusting directory placement. The 0.03% cross-match contamination in session 2.2 is negligible but the pattern exists; an analyst seeing an unexpected slug in a match's events JSONL should read it as "subscription lifecycle artifact at match transition," not as data corruption.
+
+**Next (Phase 2 closeout).**
+- CLOB WS worker using `polymarket-us` SDK; empirical auth probe (session 2.1 deferral).
+- Reconnect tests on Sports WS and CLOB WS.
+- End-to-end verification on a live in-play match.
+- Close Phase 2 ACs.
+- Bug #4 (reconnect-when-empty loop) stays parked unless it interferes with operations.
+
+---
+
+**Commit 5: trades subscription + Phase 2 acceptance test procedures.**
+
+**CLOB scope resolution (SDK probe, run in Render Shell).** The `polymarket-us==0.1.2` SDK exposes two WS factories, `markets` and `private`. `MarketsWebSocket.subscribe_market_data` (full order book), `subscribe_market_data_lite` (price-only), `subscribe_trades` (executions) — all three are subscription types on the same Markets WebSocket connection. Plan §4's distinction between "Sports WS" and "CLOB WS" doesn't map to a separate endpoint in this SDK; both are the same MarketsWebSocket. Session 2.1's existing Sports worker already captures CLOB order book state via `subscribe_market_data`. PM-Tennis has not yet built CLOB capture (per operator; their Phase 3 work, not yet landed) so no parallel implementation to read from.
+
+**Change.** One commit, minimal. Added `ws.subscribe_trades(tr_request_id, batch)` after the existing `subscribe_market_data` call in `sports_ws.py:_run_once`. Handler for the `trade` event name was already registered from session 2.1 (`_on_trade` → `_handle_payload("trade", msg)`); no router change needed. Trade events flow to the same per-match JSONL as market_data events, distinguished by the `event_name` field on each record. Log line updated to show both `request_id` values per batch.
+
+**Why the trades addition.** Research-question value for Q3 and Q4. Q3 (CLOB reaction time) gains execution-level signal — Phase 7 analysis can filter "noise requotes" from "requotes that moved an actual trade." Q4 (reliability) gains an independent stream-completeness channel separate from quote stream completeness. Cost is one line. Retrofitting later would mean re-subscribing on every existing connection or backfilling analysis with incomplete signal. Operator also noted: Phase 2 AC commits to "both workers"; even though the SDK collapses the distinction, honoring the two-stream capture commitment keeps the study faithful to its plan.
+
+**Also shipped in commit 5:** `docs/phase_2_acceptance_tests.md` — procedures for the three remaining ACs (Markets WS reconnect test, discovery worker reconnect via code review, end-to-end verification on a live match). Operational documents, not code. Run manually from Render dashboard when conditions permit (reconnect test requires live match; end-to-end requires live match).
+
+**Phase 2 AC closeout.**
+
+| AC (per plan §6 / session 2.1 log) | Status | Evidence |
+|---|---|---|
+| Discovery loop runs 1+ hr, non-empty polls, meta.json written | **Met** | Session 2.1 ran 63 polls over ~1hr; session 2.2 accumulated thousands of poll cycles. Diagnostic confirmed 16 matches/*/meta.json files exist with correct schema post-commit-2. |
+| Sports WS worker runs 1+ hrs against live data | **Met** | Sports worker running continuously since session 2.1 deploy 17:39 UTC 2026-04-22. Over 20,000 events routed across 16 matches by session 2.2 diagnostic time. |
+| Raw JSONL written with `arrived_at_ms` and `match_id` | **Met (with caveat)** | All JSONL records carry both fields. Post-commit-2 records have `match_id_resolved: true` for live matches and correct `_YYYY-MM-DD` suffixes. Caveat: orphan `_unresolved/` events exist (post-match-end subscription-lifecycle artifacts, bug #2 mechanism understood and closed — not a capture-layer correctness failure). |
+| End-to-end live match on both Polymarket surfaces | **Procedure-ready** | Procedure documented in `docs/phase_2_acceptance_tests.md` §C. Gated on live match availability — cannot run while tennis is not in play. Commit 5's trades subscription enables the "both surfaces" check. |
+| Reconnect test on both WS | **Procedure-ready for Markets WS; discovery closed on code-review grounds** | Markets WS procedure in `docs/phase_2_acceptance_tests.md` §A (gated on live match). Discovery reconnect via `orchestrator.supervise()` code review in §B — catch-sleep-restart pattern confirmed. |
+
+**Remaining operational work (not code, not blocking commit):**
+- Run reconnect test (§A) when a live match is active.
+- Run end-to-end verification (§C) when a live match is active.
+- Append pass/fail notes to working log under the session they run in.
+
+**Phase 2 substantively complete** pending those two operational runs. Moving to Phase 3 (API-Tennis activation) can proceed in parallel with those runs — they don't block Phase 3 work.
+
+**Next.**
+- Deploy commit 5. Confirm trades subscription starts producing `event_name=trade` records in match JSONLs when live tennis resumes.
+- Operator: run §A and §C procedures on next live match window. Append results.
+- Phase 3 kickoff: activate API-Tennis Business tier trial, build API-Tennis WS worker. Phase 3 triggers the 14-day measurement window clock.

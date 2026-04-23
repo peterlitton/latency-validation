@@ -17,13 +17,19 @@ Subscription model:
   - One MarketsWebSocket per sub-100 batch of slugs. SDK's `client.ws.markets()`
     is a factory — each call returns a fresh connection-capable instance.
     We open N of these (N = ceil(slugs / 100)).
-  - For each connection we call `subscribe_market_data` to get full order-book
-    payloads. PM-Tennis's stress-test uses the generic subscribe() with
+  - For each connection we call both `subscribe_market_data` (full order
+    book state, feeds Q3 reaction-time analysis) and `subscribe_trades`
+    (execution events, feeds Q3/Q4 with trade-level signal). The SDK
+    collapses what plan §4 calls "Sports WS" and "CLOB WS" into one
+    MarketsWebSocket with parallel subscription types; session 2.2
+    honors the plan's two-worker commitment by subscribing to both
+    streams on the same connection.
+  - PM-Tennis's stress-test uses the generic subscribe() with
     SUBSCRIPTION_TYPE_MARKET_DATA; we use the convenience method (identical
     wire behavior).
   - We register handlers for all six events the SDK emits on markets:
     market_data, market_data_lite, trade, heartbeat, error, close. Our
-    subscription only produces market_data + heartbeat/error/close, but
+    subscriptions produce market_data + trade + heartbeat/error/close;
     extra handlers cost nothing and guard against SDK default changes.
 
 Raw preservation (plan §5.2):
@@ -119,7 +125,7 @@ class SportsWorker:
       1. Read current slugs from DiscoveryLoop.
       2. Batch into sub-100 groups.
       3. For each batch, spawn one MarketsWebSocket, register handlers,
-         connect, subscribe to market_data.
+         connect, subscribe to market_data AND trades.
       4. Await until any connection fails; all connections are torn down
          together; outer loop reconnects after backoff.
     """
@@ -187,14 +193,29 @@ class SportsWorker:
                 await ws.connect()
                 # Reset backoff the moment the first connection succeeds.
                 self._backoff = WS_RECONNECT_INITIAL_SECONDS
-                request_id = f"md-{uuid.uuid4().hex[:12]}"
-                await ws.subscribe_market_data(request_id, batch)
+
+                # Subscribe to full order book data (feeds Q3 reaction-time
+                # analysis: quote-level signal for the CLOB).
+                md_request_id = f"md-{uuid.uuid4().hex[:12]}"
+                await ws.subscribe_market_data(md_request_id, batch)
+
+                # Subscribe to trade notifications (feeds Q3/Q4: execution-level
+                # signal distinguishes real market-moving events from noise
+                # requotes, and trade-stream completeness is an independent
+                # reliability channel). Session 2.2 addition honoring plan §4's
+                # two-surface commitment; the SDK exposes both under one
+                # MarketsWebSocket.
+                tr_request_id = f"tr-{uuid.uuid4().hex[:12]}"
+                await ws.subscribe_trades(tr_request_id, batch)
+
                 log.info(
-                    "Subscribed batch %d/%d with %d slugs (request_id=%s).",
+                    "Subscribed batch %d/%d with %d slugs "
+                    "(market_data=%s, trades=%s).",
                     batch_idx + 1,
                     len(batches),
                     len(batch),
-                    request_id,
+                    md_request_id,
+                    tr_request_id,
                 )
                 markets_ws_list.append(ws)
 
