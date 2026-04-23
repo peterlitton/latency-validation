@@ -185,3 +185,20 @@ Commit-1 migration dry-run evidence (for the record):
 - v2 correctly plans: phase 1 renames 2 in matches/, skips 2 target-exists; phase 2 renames all 8 in polymarket_sports/ (6 via sibling lookup, 2 via rename_map). Tested end-to-end on synthetic archive mirroring the observed state; idempotent on re-run.
 
 **Outstanding: two `matches/` _unknown-date dirs survive phase 1** for matches where commit 2 wrote a fresh correctly-named dir. Phase 1 skips them (target exists). Three handling options open for operator decision: leave as-is (provenance), delete (risk: any fields unique to old meta.json), or rename with a suffix like `.migrated` (preserves without polluting active namespace). Default in commit 3 is leave-as-is — diagnostic skips them for ownership purposes.
+
+---
+
+**Commit 4: glob fix.**
+
+Single change. `code/capture/diagnose_bug2.py` glob updated from `events-*.jsonl` to `[0-9]*.jsonl` to match the actual filename pattern (`{YYYY-MM-DD}.jsonl` per archive.py). Nothing else.
+
+Considered and rejected: a v3 migration to quarantine the orphan `_unknown-date` dirs. Drafted, tested, decided against. The orphan dirs hold session-2.1-era data that doesn't feed any of Q1–Q4 (no API-Tennis stream existed, the matches are over). Cleanup serves namespace hygiene, not research questions. Standing instruction now: default to simplest option for problems that don't serve research questions or capture-layer correctness. Migration stays where v2 left it; diagnostic will run against the dirty state. Orphan-dir noise is tolerable for diagnosing bug #2, which is about new event routing rather than historical placement.
+
+**Bug #4 status.** Confirmed in commit 3's logs — Sports WS reconnect-when-empty loop visible at every 30s tick. Tightening still deferred; not blocking.
+
+**Bug #2 status.** Diagnosis is the next thing. Commit 4 deploys diagnostic only. Run `python -m code.capture.diagnose_bug2 --archive-root /data/archive`, paste output. Bug #2 root cause from there.
+
+**Next.**
+- Deploy commit 4. Run diagnostic. Paste output for bug #2 analysis.
+- Bug #2 fix in code.
+- CLOB WS, end-to-end verification, reconnect tests, Phase 2 ACs.

@@ -86,20 +86,25 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def collect_match_events(match_dir: Path) -> list[dict]:
-    """Read all events-*.jsonl in a match dir, flattened."""
+    """Read all per-day event JSONL files in a match dir, flattened.
+
+    Files are named `{YYYY-MM-DD}.jsonl` per archive.py. Glob keys off the
+    leading-digit pattern to avoid picking up unrelated files (meta.json
+    lives in the matches/ tree, but defensive coding nonetheless).
+    """
     all_events = []
-    for jsonl in sorted(match_dir.glob("events-*.jsonl")):
+    for jsonl in sorted(match_dir.glob("[0-9]*.jsonl")):
         all_events.extend(read_jsonl(jsonl))
     return all_events
 
 
 def collect_unresolved_events(sports_root: Path) -> list[dict]:
-    """Read everything under _unresolved/. Structure mirrors per-match dirs."""
+    """Read everything under _unresolved/. Same per-day filename pattern."""
     unresolved_dir = sports_root / "_unresolved"
     if not unresolved_dir.exists():
         return []
     all_events = []
-    for jsonl in sorted(unresolved_dir.glob("events-*.jsonl")):
+    for jsonl in sorted(unresolved_dir.glob("[0-9]*.jsonl")):
         all_events.extend(read_jsonl(jsonl))
     return all_events
 
