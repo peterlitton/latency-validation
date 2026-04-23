@@ -353,3 +353,73 @@ Six `_unknown-date` orphan dirs remain from session-2.1-era captures (pre-commit
 **Phase 3 unblocked pending tier upgrade.** Activate API-Tennis Business trial (triggers 14-day measurement clock), build API-Tennis WS worker, resume comparative capture.
 
 **End of session 2.2.**
+
+---
+
+## Session 3.1 — 2026-04-23 (continues, Phase 3 kickoff)
+
+**Context.** API-Tennis Business trial activated. 14-day measurement clock runs through ~May 7. Madrid Open in progress through May 3. Phase 3 scope per plan §6: API-Tennis WS worker, cross-feed match identity, smoke-test on a live match across all three data streams.
+
+**Empirical schema probes before coding** (lesson from session 2.2's three schema-assumption bugs):
+
+*Probe 1 (REST get_livescore, get_events, get_tournaments):*
+- Event type keys: `265=Atp Singles`, `266=Wta Singles`, `281=Challenger Men Singles`, `272=Challenger Women Singles`.
+- Madrid tournament keys: `2003` (WTA), `2004` (ATP). Tournament name on API-Tennis is just `"Madrid"` — not `"Madrid Open"` like Polymarket. Cross-feed tournament-name normalization needed (handled via manual overrides, not fuzzy matching, per operator Q2 decision).
+- Player names are initials-dot-surname: `M. Trungelliti`, `D. Merida Aguilar`. Polymarket has full names. String-equality match across feeds is impossible.
+- `event_live` is "1" (string) even for finished matches — it just means "inside the active livescore feed's window." Live-filter logic must check `event_status not in {"Finished", "Retired", "Cancelled"}`, not trust `event_live`. Mirrors Polymarket lesson.
+- `pointbypoint` is full game history from match start, not deltas. Cadence implications for Q2 analysis (if we ever switch to point-level correlation).
+
+*Probe 2 (API-Tennis WebSocket 60s capture):*
+- Shape: every message is a JSON list. 11 messages over 60s, average ~8.5 items per message across ~11 unique matches live globally. Multi-match per message means an update to any match causes the whole active set to re-push.
+- Update rate: ~0.18 msg/s overall, ~1 update per match per minute. Dramatically lower cadence than Polymarket (per-second on heavy matches). API-Tennis is the slower clock, Polymarket the faster.
+- Madrid matches appeared in the stream (10 Madrid-tagged items).
+- Item shape has 24 fields, matching docs.
+
+*Probe 3 (Polymarket Markets WS event-type classification):*
+- Probe 3 returned empty (picked a dead match), but the archive itself answered the question at higher statistical confidence: across every captured Polymarket event in every match archive this session (20k+ events, multi-hour capture on Sabalenka plus 30+ other matches), only two distinct `event_name` values exist: `market_data` and `trade`. Zero heartbeats, zero session-lifecycle events, zero game-state events.
+
+**Scope finding — three sources reinterpreted.**
+
+Plan §4 treats "Sports WS" and "CLOB WS" as distinct game-state-vs-orderbook streams. Session 2.2 established that the `polymarket-us` SDK collapses them into one MarketsWebSocket. Session 3.1 establishes that Polymarket emits no game-state events at all — only order book deltas (`market_data`) and trade executions (`trade`). Game state must be inferred from API-Tennis.
+
+Three sources under empirical reality:
+1. **API-Tennis WS** — game events (point/game/set/match transitions)
+2. **Polymarket Markets WS `subscribe_market_data`** — CLOB order book state
+3. **Polymarket Markets WS `subscribe_trades`** — CLOB trade executions
+
+All three capturing to the same `match_id` directory is the Phase 3 AC target. Plan §4 language needs updating to reflect reality; deferred to plan-revision cycle (not blocking session 3.1).
+
+**Commit 9: API-Tennis WS worker.**
+
+Files:
+- `code/capture/api_tennis_ws.py` — new. `ApiTennisWorker` class mirrors `SportsWorker` structure: connect → receive loop → route by event_key. Reconnect on transport errors with exponential backoff (reuses Polymarket's `WS_RECONNECT_*` constants). Idle-waits forever if `API_TENNIS_KEY` is unset rather than crash-looping.
+- `code/capture/cross_feed.py` — new. Loads `cross_feed_overrides.yaml`, maps `event_key` (int) → `match_id` (str). Empty overrides file = everything routes to `_unresolved`. YAML parse errors log and fall back to empty, worker keeps running.
+- `code/capture/config.py` — adds `API_TENNIS_KEY`, `API_TENNIS_WS_BASE`, `API_TENNIS_TIMEZONE` (UTC default), `CROSS_FEED_OVERRIDES_PATH`.
+- `code/capture/main.py` — adds third supervised worker (`supervise("api_tennis_ws", ...)`). Orchestrator changes mechanical.
+- `cross_feed_overrides.yaml` — new file, empty with comment header documenting format.
+- `docs/cross_feed_overrides.md` — new. Operator workflow for adding entries as matches appear on both feeds.
+
+`archive.py` already has `api_tennis_path` defined (Phase 2 preparation) — no edits needed there.
+
+**Scope decisions (session 3.1, explicit):**
+
+- Q1: **Raw preservation, no dedup.** Per plan §5.2. Each item of each message is archived individually with shared `arrived_at_ms` (captured at message receipt, not per-item). Phase 7 analysis decides dedup semantics against real data.
+- Q2: **Manual overrides, no fuzzy matching.** Operator edits `cross_feed_overrides.yaml` as matches appear. Unresolved events land in `api_tennis/_unresolved/{date}.jsonl`, recoverable at analysis time via `event_key` join.
+
+**Not yet done (post-deploy work):**
+
+1. Deploy commit 9. Confirm `[supervisor:api_tennis_ws] starting worker` appears in logs and `API-Tennis WS connected. Streaming events.` follows without reconnect loops.
+2. Confirm `/data/archive/api_tennis/_unresolved/2026-04-23.jsonl` grows (empty overrides = all events unresolved).
+3. Pick one live match on both feeds (smoke-test candidates from operator: Budkov-Kjaer vs Opelka, Savannah Challenger). Add its `event_key → match_id` to overrides.yaml.
+4. Watch for `/data/archive/api_tennis/{match_id}/{date}.jsonl` to appear within 60s (reconnect cycle).
+5. Verify tail record has `match_id_resolved: true` and the expected match_id.
+
+**Open for session 3.2+:**
+
+- Plan revision to reflect three-source reality (§4 language, §6 AC).
+- Post-match check procedures for API-Tennis source (mirror runbook §C steps 6-10 for api_tennis/ tree).
+- Reconnect test for API-Tennis WS (mirror runbook §A).
+- Phase 3 close-out AC table once smoke-test passes.
+
+**Standing risks from session 2.2 still live:**
+- Render tier upgrade before full Phase 3 measurement window. Still Starter tier unless you've upgraded since. Recommend confirming upgrade before committing the 14-day trial budget.

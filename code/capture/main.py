@@ -1,7 +1,7 @@
 """Capture orchestrator.
 
-Runs the discovery loop and Sports WS worker as concurrent supervised tasks.
-CLOB WS worker joins in session 2.2.
+Runs the discovery loop, Sports WS worker, and API-Tennis WS worker as
+concurrent supervised tasks. Session 3.1 adds the third worker.
 
 Supervision model:
   - Each worker runs inside `supervise(name, factory)`, which catches any
@@ -29,6 +29,7 @@ import logging
 import signal
 from typing import Awaitable, Callable
 
+from .api_tennis_ws import ApiTennisWorker
 from .config import (
     SHUTDOWN_GRACE_SECONDS,
     TENNIS_SPORT_SLUG,
@@ -100,7 +101,7 @@ def _install_shutdown_handlers(loop: asyncio.AbstractEventLoop, event: asyncio.E
 async def run() -> None:
     """Main entry point."""
     _setup_logging()
-    log.info("Capture orchestrator starting (Phase 2, session 2.1 scope).")
+    log.info("Capture orchestrator starting (Phase 3, session 3.1 scope).")
 
     # Verify the Gamma sport slug on startup. Non-fatal if it fails —
     # polls will just return empty, visible in logs. This matches the
@@ -113,6 +114,7 @@ async def run() -> None:
 
     discovery = DiscoveryLoop(gamma)
     sports = SportsWorker(discovery)
+    api_tennis = ApiTennisWorker()
 
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -127,6 +129,10 @@ async def run() -> None:
         asyncio.create_task(
             supervise("sports_ws", sports.run_forever),
             name="supervise.sports_ws",
+        ),
+        asyncio.create_task(
+            supervise("api_tennis_ws", api_tennis.run_forever),
+            name="supervise.api_tennis_ws",
         ),
     ]
 

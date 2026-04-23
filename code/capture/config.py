@@ -22,6 +22,16 @@ OVERRIDES_PATH: Path = Path(
     os.environ.get("OVERRIDES_PATH", str(ARCHIVE_ROOT / "overrides.yaml"))
 )
 
+# Cross-feed overrides: maps API-Tennis event_key (int) to Polymarket-owned
+# match_id (str). Added in session 3.1 per Q2 decision: manual curation, no
+# fuzzy matching in Phase 3. See docs/cross_feed_overrides.md for format.
+CROSS_FEED_OVERRIDES_PATH: Path = Path(
+    os.environ.get(
+        "CROSS_FEED_OVERRIDES_PATH",
+        str(ARCHIVE_ROOT / "cross_feed_overrides.yaml"),
+    )
+)
+
 
 # --- Gamma discovery --------------------------------------------------------
 
@@ -67,7 +77,8 @@ POLYMARKET_US_API_SECRET_KEY: str = os.environ.get(
 # Larger active sets span multiple connections.
 MARKETS_WS_SLUG_CAP: int = int(os.environ.get("MARKETS_WS_SLUG_CAP", "100"))
 
-# Reconnect backoff: start, cap, factor.
+# Reconnect backoff: start, cap, factor. Shared between Polymarket and
+# API-Tennis workers — same transport-level semantics.
 WS_RECONNECT_INITIAL_SECONDS: float = float(
     os.environ.get("WS_RECONNECT_INITIAL_SECONDS", "1.0")
 )
@@ -85,3 +96,26 @@ WORKER_RESTART_DELAY_SECONDS: float = float(
 SHUTDOWN_GRACE_SECONDS: float = float(
     os.environ.get("SHUTDOWN_GRACE_SECONDS", "5.0")
 )
+
+
+# --- API-Tennis WebSocket ---------------------------------------------------
+
+# API-Tennis API key, query-string auth. Business trial through ~May 7 2026;
+# 14-day measurement clock starts at first use. Unlike Polymarket's handshake
+# auth, API-Tennis just appends ?APIkey=... to the WSS URL.
+API_TENNIS_KEY: str = os.environ.get("API_TENNIS_KEY", "")
+
+# Base WebSocket URL. Key + timezone appended at connect time.
+API_TENNIS_WS_BASE: str = os.environ.get(
+    "API_TENNIS_WS_BASE", "wss://wss.api-tennis.com/live"
+)
+
+# Timezone for event_time / event_date fields in received messages. UTC
+# keeps everything aligned with Polymarket's timestamps and with
+# arrived_at_ms (captured at handler entry). Overrideable for debugging.
+API_TENNIS_TIMEZONE: str = os.environ.get("API_TENNIS_TIMEZONE", "UTC")
+
+# Reconnect backoff reuses the same WS_RECONNECT_* constants as Polymarket
+# — no API-Tennis-specific overrides. If cadence characteristics diverge
+# (e.g., API-Tennis kicks clients more aggressively), add dedicated
+# constants then. For now: single set.

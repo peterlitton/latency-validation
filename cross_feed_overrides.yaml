@@ -1,0 +1,21 @@
+# Cross-feed match identity overrides.
+#
+# Maps API-Tennis event_key (int) to Polymarket-owned match_id (str).
+# Edited by the operator as matches appear on both feeds.
+#
+# Format:
+#     <api_tennis_event_key>: <polymarket_match_id>
+#
+# Example (commented out):
+#     # 12121266: madrid-open_daniel-merida-aguilar_marco-trungelliti_2026-04-23
+#     # 12121257: challenger-savannah_aidan-mayo_andres-andrade_2026-04-23
+#
+# The worker re-reads this file on every (re)connect cycle — no restart
+# needed after editing. Unresolved events (event_key not in this map)
+# land in /data/archive/api_tennis/_unresolved/{date}.jsonl and can be
+# curated later without data loss.
+#
+# Keys must be integers. String-like keys ("12121266") are coerced on
+# load with a warning; malformed keys are skipped and logged.
+#
+# For workflow and examples, see docs/cross_feed_overrides.md.
