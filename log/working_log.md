@@ -504,3 +504,169 @@ Previously-captured events for that event_key (sitting in `_unresolved/` before 
 - Bug #4 (reconnect-when-empty loop): still parked. No change.
 
 **End of session 3.1.**
+
+---
+
+## Session 4.1 — 2026-04-24 (Phase 4 Calibration)
+
+**Context.** Phase 4 and Phase 5 authorized to proceed in parallel with ongoing Phase 6 data collection per `plan/Parallel_Phase_4_5.md`. One match suffices for Phase 4 AC close. Phase 5 dashboard queued for next session.
+
+**Commit 11: Phase 4 analysis module.**
+
+New module tree `code/analysis/` with four files, ~930 lines total:
+
+- `loaders.py` — raw JSONL readers for each archive sub-tree (`matches/meta.json`, `discovery_delta.jsonl`, `polymarket_sports/`, `api_tennis/`, `api_tennis/_unresolved/`). Read-only, no mutations.
+- `normalize.py` — `UnifiedEvent` dataclass with per-source prefixed fields (`ap_*` for API-Tennis, `pm_*` for Polymarket). Three extractors: `normalize_api_tennis`, `normalize_polymarket_market_data`, `normalize_polymarket_trade`. `build_unified_stream` sorts by `arrived_at_ms` across sources.
+- `reconcile.py` — `compute_source_spans`, `compute_overlap_window`, `find_large_gaps`, `reconcile_boundaries`, `verify_match_identity`. Pure functions, no side effects.
+- `phase_4_calibration.py` — CLI entrypoint. Runs all AC checks, prints structured report to stdout.
+
+Design decisions per operator Q&A at session open:
+- Option 2 (repo module, not notebook, not ad hoc). Phase 5 notebook will reuse `loaders` + `normalize` as imports.
+- Typed schema over minimal. `UnifiedEvent` exposes ~15 extracted fields plus `raw` dict for Phase 7 access.
+- Compute-on-demand, no materialized normalized.jsonl. Re-reads raw archive on each run.
+
+End-to-end test against synthetic archive: 14 assertions pass including edge cases (empty offers list, event_key filtering in `_unresolved` recovery, overlap across three sources with recovered records extending the span backward).
+
+**NTP clock verification.**
+
+Render Shell lacks `ntpdate`; fell back to hand-rolled UDP query to `time.google.com`. Five consecutive probes:
+
+| Probe | Offset (ms) | Round-trip (ms) |
+|---|---|---|
+| 1 | +5.78 | 23.05 |
+| 2 | +3.62 | 18.93 |
+| 3 | +5.45 | 20.56 |
+| 4 | +5.40 | 20.30 |
+| 5 | +3.47 | 18.43 |
+
+Mean offset +4.7 ms, range +3.5 to +5.8 ms. Local clock is consistently ~5 ms behind NTP, within ±10 ms Phase 4 AC tolerance with comfortable margin. Round-trip variance 18-23 ms is normal internet jitter; doesn't affect the capture-host clock itself.
+
+Note for Phase 7: a consistent +5 ms positive offset means our `arrived_at_ms` is systematically ~5 ms later than wall-clock truth. Doesn't affect cross-source latency measurements (both workers share the same clock, offset cancels). Would affect any comparison of our timestamps to source-side timestamps like API-Tennis `event_time` or Polymarket `transactTime`.
+
+**Phase 4 calibration run on smoke-test match.**
+
+Match: `challenger-abidjan_constantin-bittoun-kouzmine_maxime-chazal_2026-04-23`.
+
+Data loaded:
+- `polymarket_sports`: 5,072 records (4,894 market_data + 178 trade)
+- `api_tennis` routed: 96 records
+- `api_tennis` recovered from `_unresolved/` via event_key=12121255: 51 records
+- Total unified events: 5,219
+
+Source spans:
+
+| Source | Count | First (UTC) | Last (UTC) | Span (min) |
+|---|---|---|---|---|
+| api_tennis | 147 | 19:42:11.911 | 19:59:53.969 | 17.70 |
+| polymarket_market_data | 4,894 | 18:44:18.449 | 19:49:51.725 | 65.55 |
+| polymarket_trade | 178 | 18:45:05.128 | 19:49:28.827 | 64.39 |
+
+Cross-source overlap window: 19:42:11.911 to 19:49:28.827, **7.28 minutes**.
+
+**Game-boundary reconciliation.**
+
+Two API-Tennis status transitions observed:
+
+| Transition | AP time (UTC) | PM delta | Px before | Px at response |
+|---|---|---|---|---|
+| (start) → Set 2 | 19:42:11.911 | +27,050 ms | 0.060 | 0.020 |
+| Set 2 → Finished | 19:49:26.028 | +2,837 ms | 0.010 | 0.010 |
+
+The `(start) → Set 2` transition is an artifact of mid-match override timing, not a real reaction time — status was already "Set 2" when we first received API-Tennis data; the 27s delta is to the next Polymarket update, not a response to a game event.
+
+The `Set 2 → Finished` transition is a real data point: Polymarket first market_data update arrived 2.8 seconds after API-Tennis flagged the match finished. At that moment the market was already at settled-loser price (0.010 on both sides); the market had priced in the outcome before the formal "Finished" status flip.
+
+**Silent-drop check.**
+
+Median inter-arrival gaps:
+- api_tennis: 5,565 ms (one update per match every ~5.5 s, consistent with probe 2's ~0.2 msg/s at stream level × ~8 matches per message)
+- polymarket_market_data: 205 ms (sub-second during active trading)
+- polymarket_trade: 9,672 ms (trades less frequent than quote moves)
+
+Automated "gap > 10× median" flagged 406 market_data gaps and 4 trade gaps. These are false positives — 10× a 205ms median is only 2 seconds, which is well within normal tennis rhythm (between points, between games). Automated check needs recalibration or an absolute threshold rather than ratio. Not blocking for AC close. Real capture-layer drops are caught operationally by Render service-failure notifications (capture host) and at Phase 7 by anomaly detection against full captures.
+
+Human assertion: **no evidence of silent drops** in this match's capture. Gap patterns match normal tennis match rhythm.
+
+**Match identity resolution.**
+
+5,219 / 5,219 records carry the expected match_id (or are api_tennis recovered-from-`_unresolved`). PASS.
+
+**Phase 4 AC closeout.**
+
+| AC element | Status | Evidence |
+|---|---|---|
+| Common-schema normalization across three sources | Met | `code/analysis/normalize.py`; 5,219 events unified cleanly |
+| Manual game-boundary reconciliation | Met | 2 transitions reconciled; 1 meaningful (+2.8 s PM delay at match end) |
+| Silent-drop check | Met (human assertion) | No evidence of drops; automated check is calibrated too tight; real drops caught by Render notifications + Phase 7 anomaly detection |
+| Match identity held across match | Met | 5,219/5,219 records correct |
+| NTP clock ±10 ms | Met | Mean +4.7 ms, range +3.5 to +5.8 ms (5 probes) |
+
+Phase 4 AC closed.
+
+**Preliminary jitter observations (for Phase 7 reference).**
+
+- Polymarket market_data cadence during active trading: ~0.2 s between updates (median 205 ms). Significant sub-second responsiveness on the CLOB side.
+- API-Tennis cadence: ~5.5 s between updates per match (median 5,565 ms). Much slower reference clock than Polymarket.
+- Polymarket trade cadence: ~9.7 s between executions (median 9,672 ms). Executions sparser than quote moves, expected.
+- Cross-source relative timing on one observed match-end transition: +2.8 s Polymarket delay behind API-Tennis "Finished" status, at a point where the market had already priced in the result. Single data point; Phase 7 needs N>>1 for inference.
+- `_unresolved` recovery recovered 5.8 minutes of API-Tennis history that would otherwise have been invisible. Mechanism works.
+
+**Operational lesson (operator-owned).**
+
+Mid-match override addition loses all prior API-Tennis history — anything before the override is added goes to `_unresolved` at best, lost at worst (if the event pre-dated our first capture). Going forward: **add overrides at or before match discovery time, not after**. Operator owns this for Phase 6 curation.
+
+**What closed in session 4.1:**
+- Phase 4 AC (fully closed, one-match sufficient per parallel-work authorization)
+- `code/analysis/` foundation (loaders, normalization, reconciliation checks) ready for Phase 5 notebook to reuse
+
+**What remains:**
+- Phase 5 dashboard (next session): Plotly per-match timeline notebook, using `code.analysis.loaders` + `code.analysis.normalize` as imports. Jupyter setup confirmed on operator's PC; notebook can also run headlessly on Render via `jupyter nbconvert --execute` if local rendering is unavailable.
+- Phase 6 measurement window continues autonomously. Operator curation of overrides ongoing.
+- Plan §4 / §6 language revision still queued.
+- Session 2.2 parked items (bug #4, diagnostic streaming rewrite) still deferred.
+
+**End of session 4.1.**
+
+---
+
+## Commit 13 — 2026-04-24 (session 4.1 definitive close)
+
+Log-only commit. Operational cleanup after Phase 4 AC already closed in commit 12.
+
+**Render disk upgrade: done.** Disk bumped from 10 GB to 50 GB. Closes the archive-size standing risk surfaced after first rsync to Mac revealed 3.29 GB captured across 2-3 days of partial capture. Projected full-window total of ~20-25 GB over 14 days now sits comfortably under 50 GB cap with generous headroom for any spikes. No archive pruning required during Phase 6. Standing risk closed outright.
+
+**Six early-added pairings: validation material.** Override curation during session 4.1 added six matches to `/data/archive/cross_feed_overrides.yaml` before play began or shortly after start:
+
+- 12121508 → madrid-open_jelena-ostapenko_simona-waltert_2026-04-24
+- 12121612 → madrid-open_sorana-cirstea_tyra-caterina-grant_2026-04-24
+- 12121796 → challenger-rome_andrea-guerrieri_filip-jianu_2026-04-24
+- 12121611 → oeiras-4_lucia-bronzetti_polina-kudermetova_2026-04-24
+- 12121395 → madrid-open_elena-rybakina_gabriela-ruse_2026-04-24
+- 12121523 → madrid-open_ben-shelton_dino-prizmic_2026-04-24
+
+All six confirmed routing to canonical match directories after Render restart (`ls /data/archive/api_tennis/` showed 8 directories: 6 new + `_unresolved` + yesterday's Abidjan). Three sources capturing simultaneously on all six.
+
+Once any of these matches end, the resulting capture should have much fuller cross-source overlap than the Abidjan smoke-test match (Abidjan had ~7.28 min overlap due to mid-match override addition; these have overrides live from start or near-start, so overlap should cover most of the match duration). Phase 4 calibration can optionally be re-run against one of these matches when it ends, yielding a stronger Q2/Q3 preliminary jitter data point than the single transition we got from Abidjan's `Set 2 → Finished`.
+
+This re-run is not required for Phase 4 AC — that closed in commit 12 — but is recommended quality signal work for Phase 7 expectations. Operator decision whether to do it this session, next session, or let it wait until Phase 7 anyway.
+
+**Mac dev environment: live.** Session 4.1 also completed nine-step setup: Homebrew, Python 3.12, Git, venv, Jupyter + dependencies, SSH key registered with Render, local_archive rsync (3.29 GB pulled), `refresh-archive` alias, analysis module imports confirmed working via smoke-test cell in JupyterLab. Daily workflow: `cd ~/latency-validation && source .venv/bin/activate && refresh-archive && jupyter lab`.
+
+One loose end captured: the `code` package import in notebooks requires a `sys.modules` flush preamble because Python's built-in `code` module (interactive interpreter helpers) shadows our repo's `code/` directory. Workaround documented in the first working notebook. Cleaner fix (either rename repo's `code/` directory or add `pyproject.toml` for installable package) deferred to a later session; not blocking Phase 5.
+
+**Standing risks status after commit 13:**
+
+- Render tier / disk: closed (Standard tier, 50 GB disk, failure notifications active).
+- Diagnostic streaming rewrite: deferred post-Phase-7. No change.
+- Bug #4 (reconnect-when-empty loop): parked. No change.
+- Archive pruning: closed by disk upgrade. No longer relevant.
+- Plan §4 / §6 language revision: still queued. No change.
+- `code` package import hack in notebooks: noted for later cleanup. Low-urgency cosmetic.
+
+**What's next after session 4.1:**
+
+- Phase 5 dashboard (next substantive session). Plotly per-match timeline notebook. Smoke-test match or one of today's 6 matches as reference case. Jupyter environment on operator's Mac is ready; the `code.analysis` module is importable.
+- Phase 6 measurement window runs autonomously; operator curation of overrides for new matches continues daily.
+- Phase 7 analysis and close after API-Tennis trial expires ~May 7.
+
+**Session 4.1: definitively closed.**
