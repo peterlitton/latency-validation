@@ -792,3 +792,118 @@ degraded-capture note, not a data-loss note.
    against the 14/14 synthetic-archive assertions from commit 11.
 
 **End of commit 14.**
+
+---
+
+## Commit 15 — 2026-04-24 (session 4.2 close)
+
+One code change (`normalize.py` trade extractor), one new notebook (`phase_5_dashboard.ipynb`), and this log entry. Wraps the remaining session 4.2 agenda from commit 14: skipped overrides, loaders rewrite decision, Phase 5 v1 dashboard delivery, and a trade-extraction schema bug surfaced by that dashboard.
+
+**Step 1 — 8 new overrides: ABANDONED.**
+
+Edits to `pair_overrides_batch2.py` never reached GitHub before the matches finished play. File on GitHub still carries stale session-4.1 TARGETS (Fils/Buse, Noskova/Arango, Putintseva/Kostyuk, Yuan/Klimovicova). Recovery path is `_unresolved/` event_key join at Phase 7 — same mechanism documented in session 3.1 commit 10. No cleanup needed; data is preserved with `event_key` fields intact. Lesson: override adds need to precede match start, not chase after it.
+
+**Step 2 — loaders streaming rewrite: SKIPPED.**
+
+Investigation via greps and module reads (no edits). Key findings:
+
+- `normalize.build_unified_stream` iterates over loader output (iterator-friendly at the loader boundary), but internally materializes a sorted `UnifiedEvent` list sized to the entire input. This, not the loaders themselves, is the actual memory ceiling for analysis runs.
+- `reconcile.py` has zero loader references — it consumes `UnifiedEvent` lists from normalize, not raw records.
+- All six loader call sites are in `phase_4_calibration.py`.
+
+Three options weighed:
+
+- **A. Cosmetic streaming** (loaders yield generators, normalize materializes anyway): solves nothing. Memory footprint unchanged.
+- **B. Full streaming across loaders AND normalize**: large blast radius; requires external-sort or heap-merge to preserve `arrived_at_ms` ordering across multi-source merge. Significant rewrite.
+- **C. Don't rewrite.** Root cause of the OOM incident (commit 14) was contention between in-container calibration and the live capture service, closed operationally by the Mac-only analysis rule. Mac has 8 GB+ RAM; current per-match data volumes (~25k records) are trivial; no memory pressure on Mac.
+
+**Decision: C.** Revisit only if Phase 7 hits a memory ceiling on the full 14-day dataset — at that point the specific symptom would dictate whether to stream loaders, normalize, or both.
+
+**Step 3 — Phase 5 dashboard v1: DELIVERED.**
+
+New file: `notebooks/phase_5_dashboard.ipynb`. Single-match per-match timeline in Plotly. Single time axis (UTC HH:MM:SS), price axis 0–1.15. Four traces on one figure:
+
+- Best bid: blue step line, `shape='hv'` (orderbook holds quote until updated).
+- Best ask: red step line, same shape.
+- Trades: green diamond markers at fill price, hover shows quantity.
+- API-Tennis status transitions: orange triangle-down markers at y=1.08 (above price band). Dedup'd — only emitted when `event_status` changes from previous.
+
+Seven cells: markdown intro → preamble (chdir + `sys.path.insert` with absolute path + flush cached stdlib `code` module) → imports → config (MATCH_ID, DATE_STR, ARCHIVE_ROOT) → load (mirrors `phase_4_calibration` loading pattern) → partition (into per-trace arrays) → chart.
+
+Validation match: Bittoun-Kouzmine vs Chazal (Challenger Abidjan, 2026-04-23). Counts after the bug fix below:
+
+| Trace | Count |
+|---|---|
+| bid points | 4858 |
+| ask points | 4894 |
+| trade markers | 178 |
+| status transitions | 2 |
+
+Chart reads sensibly. Tight bid/ask spread throughout. Chazal opens ~0.35, decays to ~0.01 over ~65 minutes. Brief spike around 19:01 (momentum reversal, ~2 min, didn't last). Trades fire across the price band. Two AP transitions visible near match end.
+
+**Phase 5 v1 AC: met.** Single-match timeline working end-to-end across all three sources from local archive via the analysis pipeline. UI polish (legend behavior with empty traces, axis grid density, transition label readability, scoreboard overlay, multi-match selector, latency annotations) deferred to v2+.
+
+**Notebook preamble fix mid-development.** First version of cell 1 used `sys.path.insert(0, '')`, which did not reliably shadow Python's stdlib `code` module (interactive interpreter helpers). Cell 2 failed with `ModuleNotFoundError: No module named 'code.analysis'; 'code' is not a package`. Fixed by changing to absolute path `sys.path.insert(0, '/Users/PeterLitton/latency-validation')`. After fix, all cells ran clean. This is the same `code` package shadowing workaround noted in session 4.1; the absolute-path form is more reliable than empty-string form.
+
+**Bug found and fixed: Polymarket trade extractor schema mismatch.**
+
+`normalize.normalize_polymarket_trade` extracted from wrong field paths. Bug shipped in commit 11 (session 4.1); undetected because Phase 4 calibration only counts records by source, never probing trade price values. Phase 5 dashboard surfaced it: `trade markers: 0` despite 178 trade records in the archive.
+
+Empirical payload shape (Bittoun-Kouzmine vs Chazal, first trade record):
+
+```
+{
+  "trade": {
+    "marketSlug": "aec-atp-conkou-maxcha-2026-04-22",
+    "price":    {"value": "0.330", "currency": "USD"},
+    "quantity": {"value": "44.000", "currency": "USD"},
+    "tradeTime": "2026-04-23T18:45:05.068622283Z",
+    "maker": {...},
+    "taker": {...}
+  }
+}
+```
+
+Old extractor fields: `trade.px`, `trade.qty`, `trade.transactTime || trade.time`. None exist in payload. Also: old code used `_coerce_price(trade.get("qty"))` which would have failed on the nested `{value, currency}` shape even if the field name had been right — wrong coercer.
+
+New extractor:
+
+```python
+pm_trade_px=_extract_px(trade.get("price")),
+pm_trade_qty=_extract_px(trade.get("quantity")),
+pm_transact_time=trade.get("tradeTime"),
+```
+
+`_extract_px` already handles the nested `{value, currency}` shape. Edit applied to `code/analysis/normalize.py` via terminal heredoc (Python `Path.read_text`/`write_text` with `assert old in src` guard). After kernel restart, trade markers went 0 → 178; green diamonds rendered along the chart.
+
+Same family as the three Polymarket schema-assumption bugs from session 2.2 (event-name set, event_live string, market_data shape) and the participant-shape bugs. Pattern: extractor written against assumed shape rather than a probed real payload sample. Standing rule: any new extractor field is probed against archive data before committing.
+
+**Maker/taker capture: deferred.** Trade payload includes `maker`/`taker` blocks (side, intent, outcome, action, taker username). Useful for Phase 7 directional analysis (was the move buyer- or seller-driven?). Requires new `UnifiedEvent` fields. Out of scope for Phase 5 v1. Queued for Phase 7 design.
+
+**Files touched this session (across commits 14 and 15):**
+
+- `code/analysis/normalize.py` — `normalize_polymarket_trade` extractor fixed (commit 15).
+- `notebooks/phase_5_dashboard.ipynb` — new (commit 15).
+- `log/working_log.md` — commit 14 incident entry + this entry (commit 15).
+
+**Standing risks after session 4.2:**
+
+| Risk | Status |
+|---|---|
+| Render service memory / crash loop | CLOSED (commit 14, op rule added) |
+| Render tier / disk | closed (Standard, 50 GB) |
+| Archive pruning | closed |
+| Diagnostic streaming rewrite (capture-layer) | deferred post-Phase-7 |
+| Loaders streaming rewrite (analysis-layer) | deliberately skipped, documented above |
+| Bug #4 (reconnect-when-empty) | cosmetic, reassessed in commit 14 |
+| Plan §4 / §6 language revision | queued, low urgency |
+| `code` package import hack in notebooks | workaround improved (absolute path); low-urgency cleanup pending |
+
+**Open for session 5.x:**
+
+- Phase 5 v2 polish: legend behavior with empty traces (Plotly hides missing-data traces by default — surfaced during the trade-bug diagnosis), axis gridline density, transition label readability, scoreboard overlay, multi-match dropdown.
+- Phase 5 latency annotations: per AP transition, annotate time-to-first-PM-response (overlap with `phase_4_calibration.reconcile_boundaries`).
+- Maker/taker `UnifiedEvent` fields (Phase 7 prep).
+- Empirical-probe-first checklist for new extractors.
+
+**End of session 4.2.**
