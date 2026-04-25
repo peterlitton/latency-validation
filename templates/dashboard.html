@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Live tennis</title>
+<link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+
+<div class="dashboard">
+
+  <div class="header">
+    <div class="header-left">
+      <span class="title">Live tennis</span>
+      <span id="live-count" class="badge-live">0 live</span>
+      <span id="upcoming-count" class="upcoming-count"></span>
+    </div>
+    <div class="header-right">
+      <div class="health">
+        <span id="api-tennis-dot" class="dot dot-unknown"></span>
+        <span class="health-label">API-Tennis</span>
+        <span id="api-tennis-age" class="health-age">—</span>
+      </div>
+      <div class="health">
+        <span id="polymarket-dot" class="dot dot-unknown"></span>
+        <span class="health-label">Polymarket</span>
+        <span id="polymarket-age" class="health-age">—</span>
+      </div>
+      <div id="clock" class="clock">--:--:-- --</div>
+    </div>
+  </div>
+
+  <div class="grid-header">
+    <div>Status</div>
+    <div>Match</div>
+    <div class="ta-c">Sets</div>
+    <div class="ta-c">Game</div>
+    <div class="ta-r">Price</div>
+  </div>
+
+  <div id="rows"></div>
+
+</div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

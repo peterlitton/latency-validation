@@ -1,25 +1,42 @@
-# latency-validation
+# PM-Dashboard
 
-Latency & Validation Study — v1.
+Live tennis dashboard for trading on Polymarket US. Personal tool, second-screen use during live trading sessions.
 
-A 14-day observation-only measurement of how a third-party tennis feed (API-Tennis) and Polymarket's public surfaces (Sports WS, CLOB WS) deliver live-match events, captured to a common archive and analyzed against four research questions.
-
-Observation-only. No trades. Validation, not competition — a null result counts.
-
-## Repo layout
-
-- `plan/` — source of truth for what v1 is doing. Start with `Latency_Validation_Study_v1.1_Plan.md`.
-- `log/working_log.md` — one entry per session. Read at session start, appended at session end.
-- `findings/findings.md` — structured around Q1–Q4. Evidence accumulates as matches are captured; written substantively in Phase 7.
-- `code/` — capture workers, normalization layer, match identity resolver, dashboard notebooks.
-- `archive/` — JSONL event archive per source per match. Gitignored. Lives on the PaaS host during capture; synced locally for analysis.
+**Status:** Phase 1A — real API-Tennis worker in place. Pending first live-match test.
 
 ## Where to start
 
-New to the study: read `plan/Latency_Validation_Study_v1.1_Plan.md` (§1 and §2 first, then §6).
+- `plan/Project_Plan.md` — what this project is and isn't
+- `log/working_log.md` — session-by-session record
+- `findings/findings.md` — operator observations from real use
 
-Starting a session: read the working log, then the relevant phase in the plan.
+## Local dev
 
-## Status
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # then fill in API_TENNIS_KEY, or set DEMO_MODE=1
+uvicorn src.main:app --reload
+```
 
-Phase 1 — Foundation.
+Open `http://localhost:8000`.
+
+## Run modes
+
+- **Real**: set `API_TENNIS_KEY` in env. Worker connects to `wss://wss.api-tennis.com/live` and streams live match data into the dashboard.
+- **Demo**: set `DEMO_MODE=1` (with or without an API key). Worker seeds five hardcoded matches matching the v11 design mockup. No network calls. Useful for design work and screenshots.
+
+If neither is set, the worker logs an error and idles. The dashboard renders empty rows.
+
+## First live-match test (10-minute gate)
+
+After deploying with `API_TENNIS_KEY` set:
+
+1. Open Render logs. Confirm `api_tennis_worker: connected, streaming events`.
+2. Watch the dashboard during a live ATP/WTA/Challenger match. Score and game point should update within a minute of changes on the broadcast.
+3. Look for `API-Tennis schema: field 'X' not found` warnings in the logs. Those reveal which defensively-guessed fields need a parser update — paste the warning into the next session and I'll patch the extractor.
+
+## Deploy
+
+Push to `main`. Render auto-deploys per `render.yaml`. `API_TENNIS_KEY` is set in the Render dashboard, not committed.
